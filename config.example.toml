@@ -1,0 +1,44 @@
+# RustWindowsMenu configuration (%APPDATA%\RustWindowsMenu\config.toml)
+
+[appearance]
+# "auto" | "dark" | "light"
+theme = "auto"
+# "compact" | "classic" | "comfortable"
+density = "classic"
+# Optional explicit font family override (e.g. "Segoe UI", "Yu Gothic UI")
+# font_family = "Yu Gothic UI"
+show_icons = true
+show_shortcuts = true
+show_timings = false
+corner_radius = 6
+
+[behavior]
+# Hold Shift while right-clicking to fall back to Windows native classic menu
+shift_bypass_to_native = true
+# Hydrate third-party COM shell extensions asynchronously on a warm STA worker
+enable_async_com_hydration = true
+# Show a subtle status footer while COM handlers are still loading
+show_loading_footer = true
+# 0 = keep all handlers inline by default; >0 can be used by profiles/CLI advice
+com_handler_budget_ms = 0
+submenu_hover_delay_ms = 140
+terminal_command = 'wt.exe -d "{dir}"'
+
+[handlers]
+# "inline" | "submenu" | "disabled"
+default_policy = "inline"
+submenu_title = "拡張メニュー"
+
+[handlers.overrides]
+# Example overrides by handler name or CLSID:
+# FileSyncEx = "submenu"
+# "{CB3D0F55-BC2C-4C1A-85ED-23ED75B5106B}" = "submenu"
+
+# Example custom entry:
+# [[custom_items]]
+# label = "Open in VS Code"
+# command = "code"
+# args = ['"{path}"']
+# scopes = ["file", "folder", "background"]
+# extensions = []
+# position = "top"
