@@ -2,11 +2,11 @@
 
 [English](#english) | [日本語](#japanese)
 
-![RustWindowsMenu v0.3.0 Side-by-Side Comparison](docs/demo.gif)
+![RustWindowsMenu v0.4.1 0.25x Slow-Mo Comparison](docs/demo.gif)
 
 High-res 60fps MP4: [docs/demo.mp4](docs/demo.mp4)
 
-> Side-by-side capture on a real file (`Cargo.toml`, 30 OS/MSIX/COM menu items, 100 ms right-button hold): Stock Windows renders its first menu frame in `176.274 ms` (`query_ms = 142.388 ms`), while `rwm` v0.3.0 with speculative off-thread cache presents all 30 items in `19.092 ms` after release (`9.2x` faster perceived response).
+> `0.25x` slow-mo side-by-side capture on a real file (`Cargo.toml`, 27 OS/MSIX/COM menu items, 100 ms right-button hold, `3 -> 2 -> 1 -> CLICK!` countdown): on a cold first click, Stock Windows renders its first menu frame in `389.534 ms` (`query_ms = 346.143 ms`), while `rwm` v0.4.1 with speculative off-thread cache presents all 27 items in `25.799 ms` (`15.1x` faster; `3.4x` faster vs warm steady-state `86.786 ms`).
 
 ---
 
@@ -18,18 +18,19 @@ High-res 60fps MP4: [docs/demo.mp4](docs/demo.mp4)
 
 Inspired by low-overhead Rust desktop utilities such as [`RustWTM`](https://github.com/RustWTM/RustWTM), **v0.3.0** moves context menu querying off Explorer's UI path into a dedicated background STA worker inside `rwm-host.exe` and communicates over lock-free shared memory (`ABI v3`).
 
-### Verified v0.3.0 Benchmarks
+### Verified v0.4.1 Benchmarks
 
 All numbers below are measured on Windows 11 with 100% of native, MSIX, and third-party COM items active.
 
-#### End-to-End Capture (`demo_capture`, `Cargo.toml`, 100 ms hold, 30 items)
+#### End-to-End Capture (`demo_capture`, `Cargo.toml`, 100 ms hold, 27 items)
 
 | Mode | Query Time | First Menu Frame After Release | Items | Speedup |
 |---|---:|---:|---:|---:|
-| Stock Windows (`IContextMenu`) | `142.388 ms` | `176.274 ms` | 30 | 1.0x |
-| **RWM v0.3.0 (`--cached`)** | `438.753 ms` (pre-built off UI path) | **`19.092 ms`** | **30** | **`9.2x`** |
+| Stock Windows (Warm, 2nd+ click) | `59.754 ms` | `86.786 ms` | 27 | 1.0x |
+| Stock Windows (Cold, 1st click / DLL load) | `346.143 ms` | `389.534 ms` | 27 | 1.0x |
+| **RWM v0.4.1 (`--cached`, hover prefetch)** | `362.166 ms` (pre-built off UI path) | **`25.799 ms`** | **27** | **`3.4x` Warm / `15.1x` Cold** |
 
-#### CLI Benchmark (`rwm bench --runs 5`)
+#### CLI Benchmark (`rwm bench --runs 5`, v0.3.0 baseline)
 
 | Target | Cold Root | Warm Root (p50 / p95) | Warm Query (p50 / p95) | Eager Submenu | 100 ms Hold `t=0 ms` (p50 / p95) |
 |---|---:|---:|---:|---:|---:|
@@ -162,18 +163,19 @@ hidden_items = []
 
 [`RustWTM`](https://github.com/RustWTM/RustWTM) のような超低オーバーヘッドな Rust 製ユーティリティの設計思想を取り入れ、**v0.3.0** ではメニュー構築をエクスプローラーの UI スレッドから `rwm-host.exe` の専用バックグラウンド STA スレッドへ逃がし、ロックフリー共有メモリ (`ABI v3`) で連携します。
 
-### 実測ベンチマーク (v0.3.0)
+### 実測ベンチマーク (v0.4.1)
 
-OS 標準項目、MSIX パッケージ動詞 (12 個)、サードパーティ COM シェル拡張を 100% 有効にした状態の実環境計測です。
+OS 標準項目、MSIX パッケージ動詞 (12 個)、サードパーティ COM シェル拡張を 100% 有効にした状態の実環境計測です (`0.25x` スロー比較動画を [docs/demo.mp4](docs/demo.mp4) に収録)。
 
-#### エンドツーエンド画面収録 (`demo_capture`, `Cargo.toml`, 100 ms 長押し, 30 項目)
+#### エンドツーエンド画面収録 (`demo_capture`, `Cargo.toml`, 100 ms 長押し, 27 項目)
 
 | モード | クエリ時間 | ボタン離上後の初回メニュー表示 | 表示項目数 | 高速化倍率 |
 |---|---:|---:|---:|---:|
-| Windows 標準 (`IContextMenu`) | `142.388 ms` | `176.274 ms` | 30 | 1.0x |
-| **RWM v0.3.0 (`--cached`)** | `438.753 ms` (離上前にバックグラウンド構築) | **`19.092 ms`** | **30** | **`9.2x`** |
+| Windows 標準 (Warm / 2回目以降) | `59.754 ms` | `86.786 ms` | 27 | 1.0x |
+| Windows 標準 (Cold / 初回クリック・DLL読込あり) | `346.143 ms` | `389.534 ms` | 27 | 1.0x |
+| **RWM v0.4.1 (`--cached` / ホバー先読み)** | `362.166 ms` (UI外事前構築) | **`25.799 ms`** | **27** | **`3.4x` Warm / `15.1x` Cold** |
 
-#### CLI ベンチマーク (`rwm bench --runs 5`)
+#### CLI ベンチマーク (`rwm bench --runs 5`, v0.3.0 ベースライン)
 
 | 対象 | Cold Root | Warm Root (p50 / p95) | Warm Query (p50 / p95) | Eager Submenu | 100 ms 保持時 `t=0 ms` (p50 / p95) |
 |---|---:|---:|---:|---:|---:|
