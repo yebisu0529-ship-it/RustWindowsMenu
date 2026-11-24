@@ -30,7 +30,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenMutexW, OpenProcess,
     OpenProcessToken, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE,
-    PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{
@@ -41,15 +41,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos, GetShellWindow,
+    DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos, GetShellWindow,
     GetWindowThreadProcessId, KillTimer, LoadIconW, MsgWaitForMultipleObjects, PeekMessageW,
     PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
     SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, TrackPopupMenuEx,
     TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_CREATE, GWLP_USERDATA, HHOOK, HICON,
     IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PM_REMOVE, QS_ALLINPUT,
     SW_HIDE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+    WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::error::{CliError, CliResult, Context};
@@ -292,7 +292,31 @@ pub fn stop_running_host(
     Ok(StopOutcome::Stopped)
 }
 
+/// Closes any running Context Menu Manager UI (`rwm-host.exe --ui`) before stopping or replacing files.
+pub fn close_manager_window() {
+    let Ok(hwnd) = (unsafe { FindWindowW(w!("RustWindowsMenuManager_v1"), PCWSTR::null()) })
+    else {
+        return;
+    };
+    if hwnd.is_invalid() {
+        return;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let proc_handle = (pid != 0)
+        .then(|| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok())
+        .flatten();
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    if let Some(handle) = proc_handle {
+        let _ = unsafe { WaitForSingleObject(handle, 3000) };
+        close(handle);
+    }
+}
+
 pub fn stop() -> CliResult<ExitCode> {
+    close_manager_window();
     let current = stop_running_host(HOST_MUTEX_NAME, HOST_EVENT_NAME, Duration::from_secs(10))?;
     let legacy = if request_stop(LEGACY_HOST_EVENT_NAME)? {
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -649,11 +673,12 @@ fn show_tray_menu(hwnd: HWND, state: &WindowState<'_>) {
             let _ = crate::gui::spawn_manager(None, false);
         }
         TRAY_CMD_TOGGLE_ENABLED => {
-            let mut next = RwmConfig::load_or_default().unwrap_or_default();
-            next.enabled = !next.enabled;
-            if next.save().is_ok() {
-                if let Some(worker) = state.menu_cache {
-                    worker.on_config_reload_signal();
+            if let Ok(mut next) = RwmConfig::load_or_default() {
+                next.enabled = !next.enabled;
+                if next.save().is_ok() {
+                    if let Some(worker) = state.menu_cache {
+                        worker.on_config_reload_signal();
+                    }
                 }
             }
         }
@@ -712,9 +737,10 @@ unsafe extern "system" fn window_proc(
                 return Some(LRESULT(1));
             }
             if message == (*state).claim_show_msg {
+                let expected_seq = wparam.0 as u64;
                 let claimed = (*state)
                     .menu_cache
-                    .is_some_and(MenuCacheWorker::on_claim_show_signal);
+                    .is_some_and(|worker| worker.on_claim_show_signal(expected_seq));
                 return Some(LRESULT(isize::from(claimed)));
             }
             if message == (*state).config_reload_msg {
@@ -731,7 +757,7 @@ unsafe extern "system" fn window_proc(
             }
             if message == WM_APP_TRAY {
                 let event = (lparam.0 as u32) & 0xffff;
-                if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
+                if event == WM_LBUTTONUP {
                     let _ = crate::gui::spawn_manager(None, false);
                 } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     show_tray_menu(hwnd, &*state);

@@ -23,7 +23,7 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetShellWindow, PostMessageW, WM_USER,
+    FindWindowW, GetShellWindow, GetWindowThreadProcessId, PostMessageW, WM_USER,
 };
 use windows_core::{w, PWSTR};
 
@@ -315,13 +315,17 @@ fn explorer_path() -> Result<PathBuf, ClassicError> {
     Ok(PathBuf::from(OsString::from_wide(&path[..len])).join("explorer.exe"))
 }
 
-fn explorer_processes(session: u32, expected: &Path) -> Result<Vec<HandleGuard>, ClassicError> {
+fn explorer_processes(
+    session: u32,
+    expected: &Path,
+) -> Result<(Vec<u32>, Vec<HandleGuard>), ClassicError> {
     let snapshot = HandleGuard(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut next = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+    let mut pids = Vec::new();
     let mut processes = Vec::new();
     while next.is_ok() {
         let name_len = entry
@@ -357,6 +361,7 @@ fn explorer_processes(session: u32, expected: &Path) -> Result<Vec<HandleGuard>,
                             && unsafe { ProcessIdToSessionId(pid, &mut candidate_session) }.is_ok()
                             && candidate_session == session
                         {
+                            pids.push(pid);
                             processes.push(handle);
                         }
                     }
@@ -372,7 +377,7 @@ fn explorer_processes(session: u32, expected: &Path) -> Result<Vec<HandleGuard>,
             return Err(error.into());
         }
     }
-    Ok(processes)
+    Ok((pids, processes))
 }
 
 fn spawn_explorer(path: &Path) -> io::Result<std::process::Child> {
@@ -500,7 +505,18 @@ pub fn restart_explorer() -> Result<(), ClassicError> {
     let mut session = 0;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session)? };
     let path = explorer_path()?;
-    let processes = explorer_processes(session, &path)?;
+    let (pids, mut processes) = explorer_processes(session, &path)?;
+    if let Ok(tray) = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
+        let mut tray_pid = 0u32;
+        unsafe { GetWindowThreadProcessId(tray, Some(&mut tray_pid)) };
+        if tray_pid != 0 && !pids.contains(&tray_pid) {
+            if let Ok(handle) = unsafe {
+                OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, tray_pid)
+            } {
+                processes.push(HandleGuard(handle));
+            }
+        }
+    }
     restart_with(&LiveExplorerRestart {
         path: &path,
         processes,

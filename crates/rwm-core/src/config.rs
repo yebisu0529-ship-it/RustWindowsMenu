@@ -187,10 +187,21 @@ impl RwmConfig {
             if trimmed.is_empty() {
                 continue;
             }
-            let lower = trimmed.to_lowercase();
+            let normalized_item = if let Some((prefix, rest)) = trimmed.split_once(':') {
+                if prefix.eq_ignore_ascii_case("verb") {
+                    format!("verb:{}", rest.trim())
+                } else if prefix.eq_ignore_ascii_case("label") {
+                    format!("label:{}", rest.trim())
+                } else {
+                    trimmed.to_owned()
+                }
+            } else {
+                trimmed.to_owned()
+            };
+            let lower = normalized_item.to_lowercase();
             if !seen.contains(&lower) {
                 seen.push(lower);
-                normalized.push(trimmed.to_owned());
+                normalized.push(normalized_item);
             }
         }
         self.hidden_items = normalized;
@@ -246,14 +257,18 @@ mod tests {
     #[test]
     fn hidden_items_normalize_and_show_customize_roundtrips() {
         let config = toml::from_str::<RwmConfig>(
-            "show_customize_entry = false\nhidden_items = [\"  verb:Share \", \"\", \"VERB:share\", \"label:メモ帳で編集\", \"label:メモ帳で編集\"]",
+            "show_customize_entry = false\nhidden_items = [\"  verb:Share \", \"\", \"VERB:share\", \"Verb:Delete\", \"verb:delete\", \"label:メモ帳で編集\", \"label:メモ帳で編集\"]",
         )
         .unwrap()
         .validated();
         assert!(!config.show_customize_entry);
         assert_eq!(
             config.hidden_items,
-            vec!["verb:Share".to_string(), "label:メモ帳で編集".to_string()]
+            vec![
+                "verb:Share".to_string(),
+                "verb:Delete".to_string(),
+                "label:メモ帳で編集".to_string(),
+            ]
         );
         let raw = toml::to_string_pretty(&config).unwrap();
         assert_eq!(toml::from_str::<RwmConfig>(&raw).unwrap(), config);

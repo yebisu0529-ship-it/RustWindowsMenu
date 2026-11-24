@@ -16,15 +16,14 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::Controls::{
     LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_HITTEST, LVNI_FOCUSED,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_F2;
 use windows::Win32::UI::Shell::{
     IFolderView, IFolderView2, IShellBrowser, IShellView, IShellWindows, IWebBrowserApp,
     SID_STopLevelBrowser, ShellWindows, SVGIO_SELECTION, SVSI_EDIT, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetAncestor, GetClassNameW, GetWindowRect, GetWindowThreadProcessId,
-    PostMessageW, SendMessageW, WindowFromPoint, CHILDID_SELF, GA_ROOT, HTCLIENT, OBJID_CLIENT,
-    WM_KEYDOWN, WM_NCHITTEST, WM_USER,
+    SendMessageW, WindowFromPoint, CHILDID_SELF, GA_ROOT, HTCLIENT, OBJID_CLIENT, WM_NCHITTEST,
+    WM_USER,
 };
 
 use crate::gesture::{self, Hit};
@@ -310,31 +309,29 @@ pub(crate) fn selection_from_hover(
                 return None;
             }
             let candidate = folder_key.folder_fs_path()?.join(name);
-            std::fs::symlink_metadata(&candidate).ok()?;
             let key = SelectionKey::from_paths(&[candidate], false, shift).ok()?;
             key.is_local_filesystem().then_some(key)
         }
     }
 }
 
-/// Starts inline rename in the live Explorer view (for `rename` invoked out of `rwm-host.exe`).
-pub(crate) fn trigger_inline_rename(defview: HWND, child: HWND) {
-    if let Some(view) = ShellView::find(defview) {
-        if let Ok(fv) = view.view.cast::<IFolderView>() {
-            if let Ok(idx) = unsafe { fv.GetFocusedItem() } {
-                if let Ok(raw) = unsafe { fv.Item(idx) } {
-                    let pidl = unsafe { OwnedPidl::from_raw_owned(raw) };
-                    if unsafe { view.view.SelectItem(pidl.as_ptr(), SVSI_EDIT.0 as u32) }.is_ok() {
-                        return;
-                    }
-                }
-            }
-        }
+/// Starts inline rename in the live Explorer view only if the single item matches `expected_hash`.
+pub(crate) fn trigger_inline_rename(defview: HWND, expected_hash: u64) {
+    let Some(view) = ShellView::find(defview) else {
+        return;
+    };
+    let Ok(selection) = capture_from_view(&view.view, view.folder_view.as_ref(), false, false)
+    else {
+        return;
+    };
+    if selection.item_count() != 1 {
+        return;
     }
-    if !child.is_invalid() {
-        unsafe {
-            let _ = PostMessageW(child, WM_KEYDOWN, WPARAM(VK_F2.0 as usize), LPARAM(0));
-        }
+    if expected_hash != 0 && selection.item_identity_hash() != expected_hash {
+        return;
+    }
+    if let Some(child_pidl) = selection.primary_child_pidl() {
+        let _ = unsafe { view.view.SelectItem(child_pidl, SVSI_EDIT.0 as u32) };
     }
 }
 

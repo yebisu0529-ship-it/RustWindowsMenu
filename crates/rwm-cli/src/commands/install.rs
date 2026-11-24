@@ -69,8 +69,23 @@ fn restore_live_handlers() -> CliResult<usize> {
     Ok(handlers::restore_rwm_blocks()?)
 }
 fn ensure_live_config() -> CliResult<()> {
-    if !rwm_core::config::config_path().exists() {
+    let path = rwm_core::config::config_path();
+    if !path.exists() {
         rwm_core::config::RwmConfig::default().save()?;
+        return Ok(());
+    }
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if rwm_core::config::RwmConfig::detect_legacy_v01_keys(&raw) {
+            let backup = path.with_file_name("config.v01.bak.toml");
+            if !backup.exists() {
+                let _ = fs::copy(&path, &backup);
+            }
+            rwm_core::config::RwmConfig::default().save()?;
+            print_line(format!(
+                "Migrated legacy v0.1 config to v0.4 defaults (backup saved at {}).",
+                backup.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -123,6 +138,61 @@ fn is_reparse_or_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
+fn has_reparse_ancestor(root: &Path, path: &Path) -> bool {
+    if let Ok(meta) = fs::symlink_metadata(root) {
+        if is_reparse_or_link(&meta) {
+            return true;
+        }
+    }
+    let Ok(rel) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                if let Ok(meta) = fs::symlink_metadata(&current) {
+                    if is_reparse_or_link(&meta) {
+                        return true;
+                    }
+                }
+            }
+            std::path::Component::ParentDir => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_owned_hook_dll(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(part) => parts.push(part),
+            _ => return false,
+        }
+    }
+    let valid_shape = match parts.as_slice() {
+        [dir, file] if dir.eq_ignore_ascii_case("bin") => is_rwm_version_file(file),
+        [versions_dir, _build_dir, file] if versions_dir.eq_ignore_ascii_case("versions") => {
+            is_rwm_version_file(file)
+        }
+        _ => false,
+    };
+    valid_shape && !has_reparse_ancestor(root, path)
+}
+
+fn append_file_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".");
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
 fn require_file(path: &Path, label: &str) -> CliResult<()> {
     if path.is_file() && fs::metadata(path)?.len() > 0 {
         Ok(())
@@ -169,7 +239,7 @@ fn stage(source: &Path, destination: &Path) -> CliResult<PathBuf> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let staged = destination.with_extension(format!("new.{}", std::process::id()));
+    let staged = append_file_suffix(destination, &format!("new.{}", std::process::id()));
     fs::copy(source, &staged)
         .context(|| format!("cannot stage {} to {}", source.display(), staged.display()))?;
     strip_motw(&staged);
@@ -178,7 +248,7 @@ fn stage(source: &Path, destination: &Path) -> CliResult<PathBuf> {
 
 fn commit(staged: &Path, destination: &Path) -> CliResult<Replacement> {
     let backup = if destination.exists() {
-        let backup = destination.with_extension(format!("rollback.{}", std::process::id()));
+        let backup = append_file_suffix(destination, &format!("rollback.{}", std::process::id()));
         fs::rename(destination, &backup)
             .context(|| format!("cannot preserve {}", destination.display()))?;
         Some(backup)
@@ -241,6 +311,9 @@ fn move_or_delete_file(
     pending: &mut Vec<PathBuf>,
     errors: &mut Vec<String>,
 ) {
+    if has_reparse_ancestor(root, path) {
+        return;
+    }
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return,
@@ -382,11 +455,18 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
         hook_dll: version_dir.join(versioned_dll_filename()),
     })?;
     let current = env.root.join("current.json");
-    let staged_current = current.with_extension(format!("new.{}", std::process::id()));
+    let staged_current = append_file_suffix(&current, &format!("new.{}", std::process::id()));
     fs::write(&staged_current, metadata)?;
     staged_guard.0.push(staged_current.clone());
 
     let had_previous_host = bin.join("rwm-host.exe").is_file();
+    let classic_was_enabled = if args.classic {
+        classic::status()
+            .map(|status| status.classic_menu_enabled)
+            .unwrap_or(false)
+    } else {
+        false
+    };
     (env.stop_hosts)()?;
     let mut replacements = Vec::new();
     for (staged, destination) in [
@@ -422,9 +502,13 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
 
     let fail_with_rollback = |cause: String,
                               replacements: Vec<Replacement>,
+                              classic_changed: bool,
                               startup_changed: bool,
                               prev_run: Option<&str>,
                               path_changed: bool| {
+        if classic_changed {
+            let _ = (env.restore_classic)();
+        }
         rollback_registry_updates(env, startup_changed, prev_run, path_changed);
         let rollback_errs = rollback(replacements);
         let restart_note = if had_previous_host && !args.no_start {
@@ -443,21 +527,25 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
         Err(CliError::new(format!("{cause}{restart_note}{suffix}")))
     };
 
+    let mut classic_changed = false;
     if args.classic {
         if let Err(error) = classic::enable() {
             return fail_with_rollback(
                 format!("failed to enable classic menu override: {error}"),
                 replacements,
                 false,
+                false,
                 None,
                 false,
             );
         }
+        classic_changed = !classic_was_enabled;
     }
     if let Err(error) = (env.ensure_config)() {
         return fail_with_rollback(
             format!("failed to initialize configuration: {error}"),
             replacements,
+            classic_changed,
             false,
             None,
             false,
@@ -477,6 +565,7 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
             return fail_with_rollback(
                 format!("failed to register startup entry: {error}"),
                 replacements,
+                classic_changed,
                 false,
                 prev_run.as_deref(),
                 false,
@@ -498,6 +587,7 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
                 return fail_with_rollback(
                     format!("failed to update user PATH: {error}"),
                     replacements,
+                    classic_changed,
                     startup_registered,
                     prev_run.as_deref(),
                     false,
@@ -510,6 +600,7 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
             return fail_with_rollback(
                 format!("installed host failed to start: {error}"),
                 replacements,
+                classic_changed,
                 startup_registered,
                 prev_run.as_deref(),
                 path_updated,
@@ -543,6 +634,14 @@ pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallRe
 }
 
 fn verify_install_root(root: &Path) -> CliResult<CurrentMetadata> {
+    if let Ok(root_meta) = fs::symlink_metadata(root) {
+        if is_reparse_or_link(&root_meta) {
+            return Err(CliError::new(format!(
+                "{} is a reparse point; refusing to delete files",
+                root.display()
+            )));
+        }
+    }
     let meta_path = root.join("current.json");
     let meta = fs::symlink_metadata(&meta_path).map_err(|_| {
         CliError::new(format!(
@@ -550,7 +649,7 @@ fn verify_install_root(root: &Path) -> CliResult<CurrentMetadata> {
             root.display()
         ))
     })?;
-    if is_reparse_or_link(&meta) || !meta.is_file() {
+    if is_reparse_or_link(&meta) || !meta.is_file() || has_reparse_ancestor(root, &meta_path) {
         return Err(CliError::new(format!(
             "{} is not a regular install manifest file",
             meta_path.display()
@@ -566,32 +665,34 @@ fn remove_owned_install_files(root: &Path, metadata: &CurrentMetadata) -> (Vec<P
     let mut pending = Vec::new();
     let mut errors = Vec::new();
     let bin = root.join("bin");
-    for file in [
-        bin.join("rwm.exe"),
-        bin.join("rwm-host.exe"),
-        bin.join("rwm_hook.dll"),
-        bin.join(versioned_dll_filename()),
-        root.join("current.json"),
-        metadata.hook_dll.clone(),
-    ] {
-        move_or_delete_file(root, &file, &mut pending, &mut errors);
-    }
-    if let Ok(meta) = fs::symlink_metadata(&bin) {
-        if !is_reparse_or_link(&meta) && meta.is_dir() {
-            if let Ok(entries) = fs::read_dir(&bin) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.starts_with("rwm.exe.")
-                        || name.starts_with("rwm-host.exe.")
-                        || is_rwm_version_file(entry.file_name().as_os_str())
-                    {
-                        move_or_delete_file(root, &entry.path(), &mut pending, &mut errors);
-                    }
+    let bin_safe = !has_reparse_ancestor(root, &bin)
+        && fs::symlink_metadata(&bin).is_ok_and(|meta| !is_reparse_or_link(&meta) && meta.is_dir());
+    if bin_safe {
+        for file in [
+            bin.join("rwm.exe"),
+            bin.join("rwm-host.exe"),
+            bin.join("rwm_hook.dll"),
+            bin.join(versioned_dll_filename()),
+        ] {
+            move_or_delete_file(root, &file, &mut pending, &mut errors);
+        }
+        if let Ok(entries) = fs::read_dir(&bin) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("rwm.exe.")
+                    || name.starts_with("rwm-host.exe.")
+                    || is_rwm_version_file(entry.file_name().as_os_str())
+                {
+                    move_or_delete_file(root, &entry.path(), &mut pending, &mut errors);
                 }
             }
-            remove_empty_dir_non_reparse(&bin);
         }
+        remove_empty_dir_non_reparse(&bin);
+    }
+    move_or_delete_file(root, &root.join("current.json"), &mut pending, &mut errors);
+    if is_owned_hook_dll(root, &metadata.hook_dll) {
+        move_or_delete_file(root, &metadata.hook_dll, &mut pending, &mut errors);
     }
     let versions = root.join("versions");
     if let Ok(meta) = fs::symlink_metadata(&versions) {
@@ -939,5 +1040,44 @@ mod tests {
             .join(BUILD_ID)
             .join(versioned_dll_filename())
             .is_file());
+    }
+
+    #[test]
+    fn uninstall_rejects_tampered_hook_dll_and_bin_junction() {
+        use std::os::windows::process::CommandExt;
+        let sb = sandbox("tamper", start_ok);
+        install_with(&sb.env, &flags()).unwrap();
+        let outside = sb._dir.path().join("outside_secret.txt");
+        fs::write(&outside, b"secret").unwrap();
+        let tampered = serde_json::to_vec_pretty(&CurrentMetadata {
+            build_id: BUILD_ID.into(),
+            abi_version: ABI_VERSION,
+            hook_dll: outside.clone(),
+        })
+        .unwrap();
+        fs::write(sb.env.root.join("current.json"), tampered).unwrap();
+
+        let ext_bin = sb._dir.path().join("ext_bin");
+        fs::create_dir_all(&ext_bin).unwrap();
+        let ext_exe = ext_bin.join("rwm.exe");
+        fs::write(&ext_exe, b"external").unwrap();
+        fs::remove_dir_all(sb.env.bin()).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &sb.env.bin().to_string_lossy(),
+                &ext_bin.to_string_lossy(),
+            ])
+            .creation_flags(0x0800_0000)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J bin failed");
+
+        uninstall_with(&sb.env, &UninstallArgs { purge: false }).unwrap();
+        assert!(outside.is_file(), "tampered hook_dll outside root must not be deleted");
+        assert!(ext_exe.is_file(), "bin junction target must not be deleted");
+        let _ = fs::remove_dir(sb.env.bin());
     }
 }

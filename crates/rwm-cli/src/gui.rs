@@ -7,6 +7,7 @@ use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rwm_core::build_info::ABI_VERSION;
@@ -19,10 +20,11 @@ use rwm_core::shell::{
     enable_dark_mode_menus, item_matches_hidden, menu_item_filter_key, InspectedMenuItem, OleGuard,
     SelectionKey,
 };
-use rwm_core::warm_pool::is_system_module;
+use rwm_core::warm_pool::is_builtin_windows_handler;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HINSTANCE,
+    HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{
@@ -39,7 +41,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::System::Threading::{CreateMutexW, CREATE_NO_WINDOW};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT,
     CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, EM_SETCUEBANNER, ICC_LISTVIEW_CLASSES,
@@ -460,14 +462,15 @@ pub fn build_menu_item_rows(
         if matched_rules[idx] {
             continue;
         }
-        let display = rule
-            .strip_prefix("label:")
-            .or_else(|| rule.strip_prefix("LABEL:"))
-            .or_else(|| rule.strip_prefix("verb:"))
-            .or_else(|| rule.strip_prefix("VERB:"))
-            .unwrap_or(rule)
-            .trim()
-            .to_string();
+        let display = if let Some((prefix, rest)) = rule.split_once(':') {
+            if prefix.eq_ignore_ascii_case("label") || prefix.eq_ignore_ascii_case("verb") {
+                rest.trim().to_string()
+            } else {
+                rule.trim().to_string()
+            }
+        } else {
+            rule.trim().to_string()
+        };
         let kind_label = if ja {
             "他ターゲットで非表示"
         } else {
@@ -514,7 +517,10 @@ pub fn merge_and_sort_handlers(
             .iter()
             .find(|b| b.clsid.eq_ignore_ascii_case(&h.clsid))
             .is_some_and(|b| b.added_by_rwm);
-        let is_system = h.dll_path.as_deref().is_some_and(is_system_module);
+        let is_system = h
+            .dll_path
+            .as_deref()
+            .is_some_and(is_builtin_windows_handler);
         seen_clsids.push(h.clsid.to_ascii_uppercase());
         rows.push(HandlerRow {
             clsid: h.clsid.clone(),
@@ -779,6 +785,17 @@ struct Controls {
     lbl_status: HWND,
 }
 
+const MANAGER_MUTEX_NAME: &str = r"Local\RustWindowsMenu_ManagerUI_v1";
+
+struct MutexHandleGuard(HANDLE);
+impl Drop for MutexHandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 struct ManagerState {
     hwnd: HWND,
     dpi: u32,
@@ -789,6 +806,7 @@ struct ManagerState {
     target_path: PathBuf,
     background: bool,
     config: RwmConfig,
+    config_load_error: Option<String>,
     report: Option<InspectReport>,
     blocked_list: Vec<BlockedHandler>,
     classic_status: Option<ClassicStatus>,
@@ -799,6 +817,8 @@ struct ManagerState {
     inspect_gen: u64,
     inspect_loading: bool,
     populating: bool,
+    modal_open: bool,
+    pending_inspect: Arc<Mutex<Option<InspectResult>>>,
     status_override: Option<String>,
 }
 
@@ -819,7 +839,14 @@ fn resolve_target(path: Option<PathBuf>, background: bool) -> (PathBuf, bool) {
 }
 
 fn send_target_to_existing(existing: HWND, path: Option<PathBuf>, background: bool) {
-    let (target, bg) = resolve_target(path, background);
+    unsafe {
+        let _ = ShowWindow(existing, SW_RESTORE);
+        let _ = SetForegroundWindow(existing);
+    }
+    let Some(path) = path else {
+        return;
+    };
+    let (target, bg) = resolve_target(Some(path), background);
     let (tag, bytes) = encode_copydata_payload(&target, bg);
     let cds = COPYDATASTRUCT {
         dwData: tag,
@@ -827,8 +854,6 @@ fn send_target_to_existing(existing: HWND, path: Option<PathBuf>, background: bo
         lpData: bytes.as_ptr() as *mut c_void,
     };
     unsafe {
-        let _ = ShowWindow(existing, SW_RESTORE);
-        let _ = SetForegroundWindow(existing);
         let _ = SendMessageW(
             existing,
             WM_COPYDATA,
@@ -838,11 +863,29 @@ fn send_target_to_existing(existing: HWND, path: Option<PathBuf>, background: bo
     }
 }
 
-pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResult<ExitCode> {
-    let existing = unsafe { FindWindowW(w!("RustWindowsMenuManager_v1"), PCWSTR::null()) }
+fn find_existing_manager_window() -> Option<HWND> {
+    unsafe { FindWindowW(w!("RustWindowsMenuManager_v1"), PCWSTR::null()) }
         .ok()
-        .filter(|h| !h.is_invalid());
-    if let Some(hwnd) = existing {
+        .filter(|h| !h.is_invalid())
+}
+
+pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResult<ExitCode> {
+    let mutex_name = wide_null(MANAGER_MUTEX_NAME);
+    let mutex_handle = unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) }
+        .context(|| "cannot create manager single-instance mutex".to_string())?;
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    let _mutex_guard = MutexHandleGuard(mutex_handle);
+    if already_exists {
+        for _ in 0..50 {
+            if let Some(hwnd) = find_existing_manager_window() {
+                send_target_to_existing(hwnd, initial_target, initial_background);
+                return Ok(ExitCode::SUCCESS);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(hwnd) = find_existing_manager_window() {
         send_target_to_existing(hwnd, initial_target, initial_background);
         return Ok(ExitCode::SUCCESS);
     }
@@ -876,7 +919,10 @@ pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResu
     }
 
     let (target_path, background) = resolve_target(initial_target, initial_background);
-    let config = RwmConfig::load_or_default().unwrap_or_default();
+    let (config, config_load_error) = match RwmConfig::load_or_default() {
+        Ok(cfg) => (cfg, None),
+        Err(err) => (RwmConfig::default(), Some(err.to_string())),
+    };
     let title = wide_null(t(
         "RustWindowsMenu - 右クリックメニュー管理",
         "RustWindowsMenu - Context Menu Manager",
@@ -911,6 +957,7 @@ pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResu
         target_path,
         background,
         config,
+        config_load_error,
         report: None,
         blocked_list: handlers::list_blocked().unwrap_or_default(),
         classic_status: classic::status().ok(),
@@ -921,6 +968,8 @@ pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResu
         inspect_gen: 0,
         inspect_loading: false,
         populating: false,
+        modal_open: false,
+        pending_inspect: Arc::new(Mutex::new(None)),
         status_override: None,
     });
 
@@ -1658,6 +1707,14 @@ fn update_header_text(state: &ManagerState) {
 fn update_status_bar(state: &ManagerState) {
     let text = if let Some(msg) = &state.status_override {
         msg.clone()
+    } else if let Some(err) = &state.config_load_error {
+        format!(
+            "{} ({err})",
+            t(
+                "config.toml 読込エラー (修正または初期化まで保存停止):",
+                "config.toml parse error (edits paused until fixed or Reset):",
+            )
+        )
     } else if state.inspect_loading {
         t(
             "メニュー項目とシェル拡張を計測中...",
@@ -1866,6 +1923,7 @@ fn start_background_inspect(state: &mut ManagerState) {
     let hwnd_raw = state.hwnd.0 as isize;
     let path = state.target_path.clone();
     let background = state.background;
+    let pending = Arc::clone(&state.pending_inspect);
     state.inspect_loading = true;
     state.status_override = None;
     update_status_bar(state);
@@ -1879,30 +1937,32 @@ fn start_background_inspect(state: &mut ManagerState) {
             let classic = classic::status().ok();
             let host_running = crate::host::is_host_running(crate::host::HOST_MUTEX_NAME);
             let host_cache_active = SharedCacheClient::open().is_some_and(|c| c.is_valid());
-            let boxed = Box::new(InspectResult {
-                gen,
-                report,
-                blocked,
-                classic,
-                host_running,
-                host_cache_active,
-            });
-            let raw = Box::into_raw(boxed);
-            let sent = unsafe {
+            {
+                let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(InspectResult {
+                    gen,
+                    report,
+                    blocked,
+                    classic,
+                    host_running,
+                    host_cache_active,
+                });
+            }
+            let _ = unsafe {
                 PostMessageW(
                     HWND(hwnd_raw as *mut c_void),
                     WM_APP_INSPECT_DONE,
-                    WPARAM(0),
-                    LPARAM(raw as isize),
+                    WPARAM(gen as usize),
+                    LPARAM(0),
                 )
             };
-            if sent.is_err() {
-                drop(unsafe { Box::from_raw(raw) });
-            }
         });
 }
 
 fn run_inspect_probe(path: &Path, background: bool) -> Result<InspectReport, String> {
+    if probe::resolve_cli_exe().is_err() {
+        return inspect_target(path, background, false).map_err(|e| e.to_string());
+    }
     let args = InspectArgs {
         target: TargetArgs {
             path: Some(path.to_path_buf()),
@@ -1912,19 +1972,49 @@ fn run_inspect_probe(path: &Path, background: bool) -> Result<InspectReport, Str
         json: true,
         timeout_ms: 20_000,
     };
-    if let Ok(value) = probe::run(
+    let value = probe::run(
         &ProbeRequest::Inspect(args),
         Duration::from_millis(20_000),
         "inspect",
-    ) {
-        if let Ok(report) = serde_json::from_value::<InspectReport>(value) {
-            return Ok(report);
+    )
+    .map_err(|e| e.to_string())?;
+    serde_json::from_value::<InspectReport>(value).map_err(|e| e.to_string())
+}
+
+fn load_latest_config_for_edit(state: &mut ManagerState) -> Option<RwmConfig> {
+    if state.config_load_error.is_some() {
+        state.status_override = Some(
+            t(
+                "config.toml にエラーがあるため上書きを中止しました。修正するか「設定を初期化」してください。",
+                "config.toml has an error; refusing to overwrite. Fix it or click Reset Config.",
+            )
+            .to_string(),
+        );
+        update_status_bar(state);
+        return None;
+    }
+    match RwmConfig::load_or_default() {
+        Ok(cfg) => Some(cfg),
+        Err(err) => {
+            state.config_load_error = Some(err.to_string());
+            state.status_override = Some(format!(
+                "{}: {err}",
+                t(
+                    "config.toml 読込エラー (上書きを中止)",
+                    "config.toml error (refusing to overwrite)",
+                )
+            ));
+            update_status_bar(state);
+            None
         }
     }
-    inspect_target(path, background, false).map_err(|e| e.to_string())
 }
 
 fn persist_config_and_reload(state: &mut ManagerState, status_msg: String) {
+    if state.config_load_error.is_some() {
+        update_status_bar(state);
+        return;
+    }
     let validated = state.config.clone().validated();
     state.config = validated;
     if let Err(err) = state.config.save() {
@@ -1934,6 +2024,22 @@ fn persist_config_and_reload(state: &mut ManagerState, status_msg: String) {
         state.status_override = Some(status_msg);
     }
     update_status_bar(state);
+}
+
+struct ModalGuard(*mut ManagerState);
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.0).modal_open = false;
+        }
+    }
+}
+
+unsafe fn with_modal<R>(ptr: *mut ManagerState, f: impl FnOnce(HWND) -> R) -> R {
+    (*ptr).modal_open = true;
+    let _guard = ModalGuard(ptr);
+    let hwnd = (*ptr).hwnd;
+    f(hwnd)
 }
 
 fn confirm_box(hwnd: HWND, text: &str, title: &str, warn: bool) -> bool {
@@ -1947,7 +2053,12 @@ fn on_item_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked: b
     let Some(row) = state.rows_items.get(row_idx).cloned() else {
         return;
     };
-    let mut cfg = RwmConfig::load_or_default().unwrap_or_else(|_| state.config.clone());
+    let Some(mut cfg) = load_latest_config_for_edit(state) else {
+        state.populating = true;
+        set_item_check(state.controls.lv_items, row_idx as i32, !checked);
+        state.populating = false;
+        return;
+    };
     if !checked {
         cfg.hidden_items.push(row.rule_key.clone());
     } else if row.from_current_target {
@@ -1982,48 +2093,65 @@ fn on_item_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked: b
     set_window_text(state.controls.lbl_items_count, &count_text);
 }
 
-fn on_handler_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked: bool) {
-    let Some(row) = state.rows_handlers.get(row_idx).cloned() else {
+unsafe fn on_handler_checkbox_changed_ptr(ptr: *mut ManagerState, row_idx: usize, checked: bool) {
+    let Some(row) = (&*ptr).rows_handlers.get(row_idx).cloned() else {
         return;
     };
     if !checked {
         if row.is_system {
-            let ok = confirm_box(
-                state.hwnd,
-                t(
-                    "これは Windows 標準のシステムシェル拡張です。\n無効にすると右クリックの一部機能が使えなくなる場合があります。\n本当にブロックしますか？",
-                    "This is a Windows system shell extension. Blocking it may disable standard menu features. Continue?",
-                ),
-                t("システム拡張の確認", "Confirm System Extension"),
-                true,
-            );
+            let ok = with_modal(ptr, |hwnd| {
+                confirm_box(
+                    hwnd,
+                    t(
+                        "これは Windows 標準のシステムシェル拡張です。\n無効にすると右クリックの一部機能が使えなくなる場合があります。\n本当にブロックしますか？",
+                        "This is a Windows system shell extension. Blocking it may disable standard menu features. Continue?",
+                    ),
+                    t("システム拡張の確認", "Confirm System Extension"),
+                    true,
+                )
+            });
             if !ok {
-                state.populating = true;
-                set_item_check(state.controls.lv_handlers, row_idx as i32, true);
-                state.populating = false;
+                let state = &mut *ptr;
+                if let Some(idx) = state
+                    .rows_handlers
+                    .iter()
+                    .position(|r| r.clsid.eq_ignore_ascii_case(&row.clsid))
+                {
+                    state.populating = true;
+                    set_item_check(state.controls.lv_handlers, idx as i32, true);
+                    state.populating = false;
+                }
                 return;
             }
         }
+        let state = &mut *ptr;
+        let Some(current_idx) = state
+            .rows_handlers
+            .iter()
+            .position(|r| r.clsid.eq_ignore_ascii_case(&row.clsid))
+        else {
+            return;
+        };
         if let Err(err) = handlers::block_clsid(&row.clsid, Some(&row.name)) {
             state.status_override = Some(format!("{}: {err}", t("ブロック失敗", "Block failed")));
             state.populating = true;
-            set_item_check(state.controls.lv_handlers, row_idx as i32, true);
+            set_item_check(state.controls.lv_handlers, current_idx as i32, true);
             state.populating = false;
             update_status_bar(state);
             return;
         }
-        if let Some(r) = state.rows_handlers.get_mut(row_idx) {
+        if let Some(r) = state.rows_handlers.get_mut(current_idx) {
             r.blocked = true;
             r.added_by_rwm = true;
             update_lv_subitem(
                 state.controls.lv_handlers,
-                row_idx as i32,
+                current_idx as i32,
                 1,
                 &handler_time_text(r, is_ja()),
             );
             update_lv_subitem(
                 state.controls.lv_handlers,
-                row_idx as i32,
+                current_idx as i32,
                 2,
                 handler_category_text(r, is_ja()),
             );
@@ -2037,51 +2165,62 @@ fn on_handler_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked
             t("右クリックへ即反映", "cache refreshed")
         ));
         update_status_bar(state);
-        unsafe { invalidate_hwnd(state.controls.lv_handlers) };
+        invalidate_hwnd(state.controls.lv_handlers);
     } else {
         let res = handlers::unblock_clsid(&row.clsid, false);
         let unblocked = match res {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(_) => {
-                let ok = confirm_box(
-                    state.hwnd,
-                    t(
-                        "このシェル拡張は RustWindowsMenu 以外でブロックされています。\nブロックを強制解除して有効化しますか？",
-                        "This extension was blocked outside RustWindowsMenu. Force unblock it?",
-                    ),
-                    t("外部ブロックの解除", "Confirm Force Unblock"),
-                    false,
-                );
+                let ok = with_modal(ptr, |hwnd| {
+                    confirm_box(
+                        hwnd,
+                        t(
+                            "このシェル拡張は RustWindowsMenu 以外でブロックされています。\nブロックを強制解除して有効化しますか？",
+                            "This extension was blocked outside RustWindowsMenu. Force unblock it?",
+                        ),
+                        t("外部ブロックの解除", "Confirm Force Unblock"),
+                        false,
+                    )
+                });
                 if !ok {
-                    false
+                    Err(None)
                 } else if let Err(err) = handlers::unblock_clsid(&row.clsid, true) {
-                    state.status_override =
-                        Some(format!("{}: {err}", t("解除失敗", "Unblock failed")));
-                    false
+                    Err(Some(format!("{}: {err}", t("解除失敗", "Unblock failed"))))
                 } else {
-                    true
+                    Ok(())
                 }
             }
         };
-        if !unblocked {
+        let state = &mut *ptr;
+        let Some(current_idx) = state
+            .rows_handlers
+            .iter()
+            .position(|r| r.clsid.eq_ignore_ascii_case(&row.clsid))
+        else {
+            return;
+        };
+        if let Err(err_msg) = unblocked {
+            if let Some(msg) = err_msg {
+                state.status_override = Some(msg);
+            }
             state.populating = true;
-            set_item_check(state.controls.lv_handlers, row_idx as i32, false);
+            set_item_check(state.controls.lv_handlers, current_idx as i32, false);
             state.populating = false;
             update_status_bar(state);
             return;
         }
-        if let Some(r) = state.rows_handlers.get_mut(row_idx) {
+        if let Some(r) = state.rows_handlers.get_mut(current_idx) {
             r.blocked = false;
             r.added_by_rwm = false;
             update_lv_subitem(
                 state.controls.lv_handlers,
-                row_idx as i32,
+                current_idx as i32,
                 1,
                 &handler_time_text(r, is_ja()),
             );
             update_lv_subitem(
                 state.controls.lv_handlers,
-                row_idx as i32,
+                current_idx as i32,
                 2,
                 handler_category_text(r, is_ja()),
             );
@@ -2094,7 +2233,7 @@ fn on_handler_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked
             row.name
         ));
         update_status_bar(state);
-        unsafe { invalidate_hwnd(state.controls.lv_handlers) };
+        invalidate_hwnd(state.controls.lv_handlers);
         if row.warm_ms.is_none() {
             start_background_inspect(state);
         }
@@ -2105,7 +2244,12 @@ fn on_setting_checkbox_changed(state: &mut ManagerState, row_idx: usize, checked
     let Some(spec) = SETTING_SPECS.get(row_idx) else {
         return;
     };
-    let mut cfg = RwmConfig::load_or_default().unwrap_or_else(|_| state.config.clone());
+    let Some(mut cfg) = load_latest_config_for_edit(state) else {
+        state.populating = true;
+        set_item_check(state.controls.lv_settings, row_idx as i32, !checked);
+        state.populating = false;
+        return;
+    };
     (spec.set)(&mut cfg, checked);
     state.config = cfg;
     let title = if is_ja() { spec.title_ja } else { spec.title_en };
@@ -2143,22 +2287,26 @@ fn pick_path_dialog(hwnd: HWND, pick_folder: bool) -> Option<PathBuf> {
     }
 }
 
-fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
+unsafe fn handle_command_ptr(ptr: *mut ManagerState, id: usize, code: u32) {
     match id {
         ID_TAB_ITEMS => {
+            let state = &mut *ptr;
             state.active_tab = 0;
             update_tab_visibility(state);
         }
         ID_TAB_HANDLERS => {
+            let state = &mut *ptr;
             state.active_tab = 1;
             update_tab_visibility(state);
         }
         ID_TAB_SETTINGS => {
+            let state = &mut *ptr;
             state.active_tab = 2;
             update_tab_visibility(state);
         }
         ID_BTN_FILE => {
-            if let Some(path) = pick_path_dialog(state.hwnd, false) {
+            if let Some(path) = with_modal(ptr, |hwnd| pick_path_dialog(hwnd, false)) {
+                let state = &mut *ptr;
                 state.target_path = path;
                 state.background = false;
                 update_header_text(state);
@@ -2166,13 +2314,15 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             }
         }
         ID_BTN_FOLDER => {
-            if let Some(path) = pick_path_dialog(state.hwnd, true) {
+            if let Some(path) = with_modal(ptr, |hwnd| pick_path_dialog(hwnd, true)) {
+                let state = &mut *ptr;
                 state.target_path = path;
                 update_header_text(state);
                 start_background_inspect(state);
             }
         }
         ID_BTN_BG => {
+            let state = &mut *ptr;
             if state.target_path.is_dir() {
                 state.background = !state.background;
                 update_header_text(state);
@@ -2185,15 +2335,15 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             }
         }
         ID_BTN_REFRESH => {
-            start_background_inspect(state);
+            start_background_inspect(&mut *ptr);
         }
         ID_EDIT_SEARCH if code == EN_CHANGE => {
-            unsafe {
-                let _ = KillTimer(state.hwnd, SEARCH_DEBOUNCE_TIMER);
-                let _ = SetTimer(state.hwnd, SEARCH_DEBOUNCE_TIMER, 120, None);
-            }
+            let hwnd = (*ptr).hwnd;
+            let _ = KillTimer(hwnd, SEARCH_DEBOUNCE_TIMER);
+            let _ = SetTimer(hwnd, SEARCH_DEBOUNCE_TIMER, 120, None);
         }
         ID_BTN_SHOW_ALL => {
+            let state = &mut *ptr;
             if state.config.hidden_items.is_empty() {
                 state.status_override = Some(
                     t("非表示にしている項目はありません。", "No items are currently hidden.")
@@ -2202,7 +2352,9 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
                 update_status_bar(state);
                 return;
             }
-            let mut cfg = RwmConfig::load_or_default().unwrap_or_else(|_| state.config.clone());
+            let Some(mut cfg) = load_latest_config_for_edit(state) else {
+                return;
+            };
             cfg.hidden_items.clear();
             state.config = cfg;
             persist_config_and_reload(
@@ -2216,6 +2368,7 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             populate_items_list(state);
         }
         ID_BTN_PREVIEW => {
+            let state = &*ptr;
             if let Ok(cli) = probe::resolve_cli_exe() {
                 let mut cmd = Command::new(&cli);
                 cmd.arg("preview");
@@ -2232,13 +2385,14 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             }
         }
         ID_BTN_BLOCK_SLOW => {
-            let slow: Vec<_> = state
+            let slow: Vec<_> = (&*ptr)
                 .rows_handlers
                 .iter()
                 .filter(|r| !r.blocked && !r.is_system && r.warm_ms.is_some_and(|m| m >= SLOW_THRESHOLD_MS))
                 .cloned()
                 .collect();
             if slow.is_empty() {
+                let state = &mut *ptr;
                 state.status_override = Some(
                     t(
                         "25 ms 以上のサードパーティシェル拡張はありませんでした。",
@@ -2259,12 +2413,15 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             } else {
                 format!("Block these slow third-party shell extensions?\n\n{list_text}")
             };
-            if !confirm_box(
-                state.hwnd,
-                &prompt,
-                t("高速化の確認", "Confirm Slow Extension Block"),
-                false,
-            ) {
+            let ok = with_modal(ptr, |hwnd| {
+                confirm_box(
+                    hwnd,
+                    &prompt,
+                    t("高速化の確認", "Confirm Slow Extension Block"),
+                    false,
+                )
+            });
+            if !ok {
                 return;
             }
             let mut count = 0usize;
@@ -2274,6 +2431,7 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
                 }
             }
             notify_host_config_reload();
+            let state = &mut *ptr;
             state.status_override = Some(if is_ja() {
                 format!("{count} 件の遅い拡張をブロックしました。")
             } else {
@@ -2282,18 +2440,21 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             start_background_inspect(state);
         }
         ID_BTN_UNBLOCK_ALL => {
-            let ok = confirm_box(
-                state.hwnd,
-                t(
-                    "RustWindowsMenu が追加したシェル拡張ブロックをすべて解除しますか？",
-                    "Restore all shell extensions previously blocked by RustWindowsMenu?",
-                ),
-                t("ブロック解除の確認", "Confirm Unblock"),
-                false,
-            );
+            let ok = with_modal(ptr, |hwnd| {
+                confirm_box(
+                    hwnd,
+                    t(
+                        "RustWindowsMenu が追加したシェル拡張ブロックをすべて解除しますか？",
+                        "Restore all shell extensions previously blocked by RustWindowsMenu?",
+                    ),
+                    t("ブロック解除の確認", "Confirm Unblock"),
+                    false,
+                )
+            });
             if !ok {
                 return;
             }
+            let state = &mut *ptr;
             match handlers::restore_rwm_blocks() {
                 Ok(n) => {
                     notify_host_config_reload();
@@ -2312,33 +2473,36 @@ fn handle_command(state: &mut ManagerState, id: usize, code: u32) {
             }
         }
         ID_BTN_OPEN_CONFIG => {
+            let state = &*ptr;
             let cfg = config_path();
-            if !cfg.exists() {
+            if !cfg.exists() && state.config_load_error.is_none() {
                 let _ = state.config.save();
             }
             let wide_path = wide_null(cfg.as_os_str());
-            unsafe {
-                let _ = ShellExecuteW(
-                    state.hwnd,
-                    w!("open"),
-                    PCWSTR(wide_path.as_ptr()),
-                    PCWSTR::null(),
-                    PCWSTR::null(),
-                    SW_SHOWNORMAL,
-                );
-            }
+            let _ = ShellExecuteW(
+                state.hwnd,
+                w!("open"),
+                PCWSTR(wide_path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
         }
         ID_BTN_RESET_CONFIG => {
-            let ok = confirm_box(
-                state.hwnd,
-                t(
-                    "設定を v0.4 初期値 (非表示ルールもクリア) に戻しますか？",
-                    "Reset config.toml and hidden item rules to defaults?",
-                ),
-                t("設定初期化の確認", "Confirm Config Reset"),
-                false,
-            );
+            let ok = with_modal(ptr, |hwnd| {
+                confirm_box(
+                    hwnd,
+                    t(
+                        "設定を v0.4 初期値 (非表示ルールもクリア) に戻しますか？",
+                        "Reset config.toml and hidden item rules to defaults?",
+                    ),
+                    t("設定初期化の確認", "Confirm Config Reset"),
+                    false,
+                )
+            });
             if ok {
+                let state = &mut *ptr;
+                state.config_load_error = None;
                 state.config = RwmConfig::default();
                 persist_config_and_reload(
                     state,
@@ -2551,14 +2715,14 @@ unsafe extern "system" fn manager_wnd_proc(
         if ptr.is_null() {
             return None;
         }
-        let state = &mut *ptr;
         match message {
             WM_CREATE => Some(LRESULT(0)),
             WM_SIZE => {
-                relayout(state);
+                relayout(&mut *ptr);
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => {
+                let state = &*ptr;
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
@@ -2566,6 +2730,7 @@ unsafe extern "system" fn manager_wnd_proc(
                 Some(LRESULT(1))
             }
             WM_CTLCOLORSTATIC => {
+                let state = &*ptr;
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 let ctrl = HWND(lparam.0 as *mut c_void);
                 let is_muted = ctrl == state.controls.lbl_items_hint
@@ -2585,6 +2750,7 @@ unsafe extern "system" fn manager_wnd_proc(
                 Some(LRESULT(state.gdi.bg_brush.0 as isize))
             }
             WM_CTLCOLOREDIT => {
+                let state = &*ptr;
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
                 SetBkColor(hdc, state.theme.list_bg);
                 SetTextColor(hdc, state.theme.fg);
@@ -2592,21 +2758,22 @@ unsafe extern "system" fn manager_wnd_proc(
             }
             WM_DRAWITEM => {
                 let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
-                draw_owner_button(dis, state);
+                draw_owner_button(dis, &*ptr);
                 Some(LRESULT(1))
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xffff;
                 let code = ((wparam.0 >> 16) & 0xffff) as u32;
-                handle_command(state, id, code);
+                handle_command_ptr(ptr, id, code);
                 Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == SEARCH_DEBOUNCE_TIMER => {
                 let _ = KillTimer(hwnd, SEARCH_DEBOUNCE_TIMER);
-                populate_items_list(state);
+                populate_items_list(&mut *ptr);
                 Some(LRESULT(0))
             }
             WM_COPYDATA => {
+                let state = &mut *ptr;
                 let cds = &*(lparam.0 as *const COPYDATASTRUCT);
                 if !cds.lpData.is_null() && cds.cbData > 0 {
                     let slice =
@@ -2623,38 +2790,56 @@ unsafe extern "system" fn manager_wnd_proc(
                 Some(LRESULT(1))
             }
             WM_APP_INSPECT_DONE => {
-                let res = Box::from_raw(lparam.0 as *mut InspectResult);
-                if res.gen == state.inspect_gen {
-                    state.inspect_loading = false;
-                    state.blocked_list = res.blocked;
-                    state.classic_status = res.classic;
-                    state.host_running = res.host_running;
-                    state.host_cache_active = res.host_cache_active;
-                    state.config = RwmConfig::load_or_default().unwrap_or_else(|_| state.config.clone());
-                    match res.report {
-                        Ok(report) => {
-                            state.report = Some(report);
+                let msg_gen = wparam.0 as u64;
+                let res = {
+                    let pending = &(*ptr).pending_inspect;
+                    pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+                };
+                if let Some(res) = res {
+                    let state = &mut *ptr;
+                    if res.gen == state.inspect_gen && res.gen == msg_gen {
+                        state.inspect_loading = false;
+                        state.blocked_list = res.blocked;
+                        state.classic_status = res.classic;
+                        state.host_running = res.host_running;
+                        state.host_cache_active = res.host_cache_active;
+                        match RwmConfig::load_or_default() {
+                            Ok(cfg) => {
+                                state.config = cfg;
+                                state.config_load_error = None;
+                            }
+                            Err(err) => {
+                                state.config_load_error = Some(err.to_string());
+                            }
                         }
-                        Err(err) => {
-                            state.status_override =
-                                Some(format!("{}: {err}", t("計測エラー", "Inspect error")));
+                        match res.report {
+                            Ok(report) => {
+                                state.report = Some(report);
+                            }
+                            Err(err) => {
+                                state.report = None;
+                                state.status_override = Some(format!(
+                                    "{}: {err}",
+                                    t("計測エラー", "Inspect error")
+                                ));
+                            }
                         }
+                        populate_items_list(state);
+                        populate_handlers_list(state);
+                        populate_settings_list(state);
+                        update_status_bar(state);
                     }
-                    populate_items_list(state);
-                    populate_handlers_list(state);
-                    populate_settings_list(state);
-                    update_status_bar(state);
                 }
                 Some(LRESULT(0))
             }
             WM_NOTIFY => {
                 let hdr = &*(lparam.0 as *const NMHDR);
                 if hdr.code == NM_CUSTOMDRAW {
-                    if let Some(res) = handle_custom_draw(state, lparam) {
+                    if let Some(res) = handle_custom_draw(&*ptr, lparam) {
                         return Some(res);
                     }
                 }
-                if hdr.code == LVN_ITEMCHANGED && !state.populating {
+                if hdr.code == LVN_ITEMCHANGED && !(*ptr).populating {
                     let nmlv = &*(lparam.0 as *const NMLISTVIEW);
                     let old_chk = (nmlv.uOldState & LVIS_STATEIMAGEMASK.0) >> 12;
                     let new_chk = (nmlv.uNewState & LVIS_STATEIMAGEMASK.0) >> 12;
@@ -2666,18 +2851,22 @@ unsafe extern "system" fn manager_wnd_proc(
                     {
                         let idx = nmlv.iItem as usize;
                         let checked = new_chk == 2;
-                        if hdr.hwndFrom == state.controls.lv_items {
-                            on_item_checkbox_changed(state, idx, checked);
-                        } else if hdr.hwndFrom == state.controls.lv_handlers {
-                            on_handler_checkbox_changed(state, idx, checked);
-                        } else if hdr.hwndFrom == state.controls.lv_settings {
-                            on_setting_checkbox_changed(state, idx, checked);
+                        let controls = &(*ptr).controls;
+                        if hdr.hwndFrom == controls.lv_items {
+                            on_item_checkbox_changed(&mut *ptr, idx, checked);
+                        } else if hdr.hwndFrom == controls.lv_handlers {
+                            on_handler_checkbox_changed_ptr(ptr, idx, checked);
+                        } else if hdr.hwndFrom == controls.lv_settings {
+                            on_setting_checkbox_changed(&mut *ptr, idx, checked);
                         }
                     }
                 }
                 None
             }
             WM_CLOSE => {
+                if (*ptr).modal_open {
+                    return Some(LRESULT(0));
+                }
                 let _ = DestroyWindow(hwnd);
                 Some(LRESULT(0))
             }
@@ -2701,13 +2890,13 @@ mod tests {
 
     #[test]
     fn copydata_payload_roundtrip() {
-        let p = Path::new(r"M:\Tools\RustWindowsMenu\Cargo.toml");
+        let p = Path::new(r"C:\Users\demo\Documents\example.txt");
         let (tag, bytes) = encode_copydata_payload(p, false);
         assert_eq!(
             decode_copydata_payload(tag, &bytes),
             Some((p.to_path_buf(), false))
         );
-        let dir = Path::new(r"M:\Tools\RustWindowsMenu");
+        let dir = Path::new(r"C:\Users\demo\Documents");
         let (tag_bg, bytes_bg) = encode_copydata_payload(dir, true);
         assert_eq!(
             decode_copydata_payload(tag_bg, &bytes_bg),

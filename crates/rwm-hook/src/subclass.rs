@@ -39,7 +39,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 // would stop this DLL loading in any process without a common controls v6 manifest.
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, EndMenu, GetParent, GetSystemMetrics, IsChild, KillTimer,
+    AllowSetForegroundWindow, EndMenu, GetParent, GetSystemMetrics, IsChild, IsWindow, KillTimer,
     PostMessageW, SendMessageTimeoutW, SetTimer, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SM_CXDRAG,
     SM_CYDRAG, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_CREATE, WM_DRAWITEM,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
@@ -191,6 +191,14 @@ fn ensure_cache_client(state: &mut ThreadState) -> Option<&SharedCacheClient> {
     state.cache_client.as_ref()
 }
 
+fn host_cache_available() -> bool {
+    with_state(|state| {
+        ensure_cache_client(state)
+            .and_then(SharedCacheClient::live_host_target)
+            .is_some()
+    }) == Some(true)
+}
+
 fn kill_gesture_timers(gesture: &Gesture<NativeMenu>) {
     if let Some((child, timer_id)) = gesture.armed_timer() {
         let _ = unsafe { KillTimer(child, timer_id) };
@@ -281,17 +289,21 @@ fn dispatch_prefetch(selection: &SelectionKey) -> bool {
         let result = match ensure_cache_client(state) {
             None => Outcome::Unavailable,
             Some(client) => {
-                if client.is_ready_or_in_flight(key_hash, now_ms) {
-                    Outcome::AlreadyWarm
-                } else if !selection.serialize_pidls(&mut scratch) {
-                    Outcome::Unavailable
-                } else if let Some(seq) = client.try_write_prefetch(
-                    key_hash,
-                    selection.shift_held(),
-                    clip_seq,
-                    &scratch,
-                ) {
-                    Outcome::Queued(HWND(client.host_hwnd() as *mut c_void), seq)
+                if let Some((_pid, host_hwnd)) = client.live_host_target() {
+                    if client.is_ready_or_in_flight(key_hash, now_ms) {
+                        Outcome::AlreadyWarm
+                    } else if !selection.serialize_pidls(&mut scratch) {
+                        Outcome::Unavailable
+                    } else if let Some(seq) = client.try_write_prefetch(
+                        key_hash,
+                        selection.shift_held(),
+                        clip_seq,
+                        &scratch,
+                    ) {
+                        Outcome::Queued(host_hwnd, seq)
+                    } else {
+                        Outcome::Unavailable
+                    }
                 } else {
                     Outcome::Unavailable
                 }
@@ -532,11 +544,7 @@ fn route(
         }
         Some(Protocol::EditLabel) => {
             if is_view {
-                let child = shell_view::view_children(defview)
-                    .into_iter()
-                    .next()
-                    .unwrap_or(defview);
-                shell_view::trigger_inline_rename(defview, child);
+                shell_view::trigger_inline_rename(defview, wparam.0 as u64);
                 return Some(LRESULT(1));
             }
             return Some(LRESULT(0));
@@ -609,7 +617,7 @@ fn route(
             None
         }
         (false, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_KEYDOWN) => {
-            dismiss_host_menu_if_tracking();
+            dismiss_host_menu_if_tracking(false);
             reset(defview);
             None
         }
@@ -729,6 +737,9 @@ fn hover_timer_fired(child: HWND, defview: HWND, timer_id: usize) {
             }
         }
         HoverAction::Prefetch(pt) => {
+            if !host_cache_available() {
+                return;
+            }
             if let (Some(screen), Some(kind)) = (
                 shell_view::client_to_screen(child, pt),
                 shell_view::child_kind(child),
@@ -782,11 +793,16 @@ fn select_timer_fired(child: HWND, defview: HWND, timer_id: usize) {
         return;
     }
     let config = config();
-    if bypassed(&config) || !config.host_menu_cache || !config.selection_prebuild {
+    if bypassed(&config)
+        || !config.host_menu_cache
+        || !config.selection_prebuild
+        || !host_cache_available()
+    {
         return;
     }
     if let Some(view) = ShellView::find(defview) {
-        if view.selection_count() > 0 {
+        let count = view.selection_count();
+        if count > 0 && count <= 16 {
             if let Ok(sel) = SelectionKey::capture_from_view(
                 &view.view,
                 view.folder_view.as_ref(),
@@ -806,7 +822,7 @@ fn right_button_down(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    dismiss_host_menu_if_tracking();
+    dismiss_host_menu_if_tracking(true);
     cancel_speculative_timers(defview);
     let stale = swap_gesture(defview, Gesture::Idle);
     // Explorer moves the selection and focus on the press itself, so it goes first.
@@ -820,21 +836,24 @@ fn right_button_down(
         if active && phase() == Phase::Idle {
             let down = gesture::point_from_lparam(lparam.0);
             let mut host_screen = None;
-            if config.host_menu_cache {
+            if config.host_menu_cache && host_cache_available() {
                 if let (Some(screen), Some(kind)) = (
                     shell_view::client_to_screen(child, down),
                     shell_view::child_kind(child),
                 ) {
                     if shell_view::hit_test(child, kind, screen) == Some(Hit::Item) {
                         if let Some(view) = ShellView::find(defview) {
-                            if let Ok(sel) = SelectionKey::capture_from_view(
-                                &view.view,
-                                view.folder_view.as_ref(),
-                                false,
-                                key_down(VK_SHIFT),
-                            ) {
-                                if dispatch_prefetch(&sel) {
-                                    host_screen = Some(screen);
+                            let count = view.selection_count();
+                            if count > 0 && count <= 16 {
+                                if let Ok(sel) = SelectionKey::capture_from_view(
+                                    &view.view,
+                                    view.folder_view.as_ref(),
+                                    false,
+                                    key_down(VK_SHIFT),
+                                ) {
+                                    if dispatch_prefetch(&sel) {
+                                        host_screen = Some(screen);
+                                    }
                                 }
                             }
                         }
@@ -1025,12 +1044,30 @@ fn launch_manager_ui(selection: &SelectionKey) {
         .spawn();
 }
 
-fn dismiss_host_menu_if_tracking() {
+fn is_view_attached(defview: HWND) -> bool {
+    with_state(|state| {
+        !state.deferred_detach.contains(&defview)
+            && state.views.iter().any(|v| v.defview == defview)
+    })
+    .unwrap_or(false)
+}
+
+fn dismiss_host_menu_if_tracking(wait_for_clear: bool) {
     let target = with_state(|state| {
-        let client = ensure_cache_client(state)?;
-        client
-            .is_host_tracking()
-            .then(|| HWND(client.host_hwnd() as *mut c_void))
+        let tracking =
+            ensure_cache_client(state).is_some_and(SharedCacheClient::is_host_tracking);
+        if !tracking {
+            return None;
+        }
+        let target = state
+            .cache_client
+            .as_ref()
+            .and_then(SharedCacheClient::live_host_target);
+        if target.is_none() {
+            state.cache_client = None;
+            return None;
+        }
+        target.map(|(_, hwnd)| hwnd)
     })
     .flatten();
     let Some(host_hwnd) = target else {
@@ -1049,10 +1086,19 @@ fn dismiss_host_menu_if_tracking() {
         )
     };
     if sent.0 == 0 {
-        let _ = unsafe { PostMessageW(host_hwnd, cancel_menu_msg_id(), WPARAM(0), LPARAM(0)) };
+        if unsafe { IsWindow(host_hwnd) }.as_bool() {
+            let _ = unsafe { PostMessageW(host_hwnd, cancel_menu_msg_id(), WPARAM(0), LPARAM(0)) };
+        }
+        return;
     }
-    let deadline = Instant::now() + std::time::Duration::from_millis(30);
+    if !wait_for_clear {
+        return;
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(15);
     while Instant::now() < deadline {
+        if !unsafe { IsWindow(host_hwnd) }.as_bool() {
+            break;
+        }
         let still = with_state(|state| {
             ensure_cache_client(state).is_some_and(SharedCacheClient::is_host_tracking)
         })
@@ -1079,11 +1125,10 @@ fn try_claim_host_show(
     let explorer_root = shell_view::root_window(defview);
     let prepared = with_state(|state| {
         let client = ensure_cache_client(state)?;
+        let (host_pid, host_hwnd) = client.live_host_target()?;
         if !client.is_ready_or_in_flight(key_hash, now_ms) {
             return None;
         }
-        let host_pid = client.host_pid();
-        let host_hwnd = HWND(client.host_hwnd() as *mut c_void);
         let req = ShowRequest {
             request_seq: 0,
             key_hash,
@@ -1126,7 +1171,7 @@ enum ContextDecision {
 
 /// Shows the native menu for one `WM_CONTEXTMENU`. `None` leaves the message to Explorer.
 fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> {
-    dismiss_host_menu_if_tracking();
+    dismiss_host_menu_if_tracking(true);
     cancel_speculative_timers(defview);
     let (prebuilt, hit_cache) =
         swap_gesture(defview, Gesture::Idle).take_for_context_menu(Instant::now());
@@ -1181,12 +1226,7 @@ fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> 
             gesture::keyboard_anchor(focus, shell_view::window_rect(defview))
         });
 
-        let still_attached = with_state(|state| {
-            !state.deferred_detach.contains(&defview)
-                && state.views.iter().any(|v| v.defview == defview)
-        })
-        .unwrap_or(false);
-        if !still_attached {
+        if !is_view_attached(defview) {
             return ContextDecision::Fallback;
         }
 
@@ -1212,6 +1252,11 @@ fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> 
         ContextDecision::Fallback => None,
         ContextDecision::HandledByHost => Some(LRESULT(0)),
         ContextDecision::ShowLocal(menu, anchor) => {
+            if !is_view_attached(defview) {
+                drop(menu);
+                drain_deferred_cleanup();
+                return None;
+            }
             let tracking = PhaseGuard::tracking(defview, &menu);
             let result = tracking.map(|_tracking| {
                 match menu.track_only(defview, (anchor.x, anchor.y), config.no_animation)? {

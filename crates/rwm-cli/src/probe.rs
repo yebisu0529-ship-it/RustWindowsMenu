@@ -112,6 +112,10 @@ pub fn resolve_cli_exe() -> CliResult<std::path::PathBuf> {
         if sibling.is_file() {
             return Ok(sibling);
         }
+        return Err(CliError::new(format!(
+            "cannot locate sibling rwm.exe beside {}",
+            exe.display()
+        )));
     }
     Ok(exe)
 }

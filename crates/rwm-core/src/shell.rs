@@ -53,7 +53,10 @@ use crate::ipc_cache::MAX_PREFETCH_BYTES;
 use crate::reg_util::{pwstr_to_string, wide_null};
 
 const MAX_PREFETCH_ITEMS: usize = 16;
-const DRIVE_REMOTE_TYPE: u32 = 4;
+const DRIVE_REMOVABLE_TYPE: u32 = 2;
+const DRIVE_FIXED_TYPE: u32 = 3;
+const DRIVE_CDROM_TYPE: u32 = 5;
+const DRIVE_RAMDISK_TYPE: u32 = 6;
 
 const FIRST_ID: u32 = 1;
 const LAST_ID: u32 = 0x7F00;
@@ -356,6 +359,33 @@ impl SelectionKey {
         hasher.finish()
     }
 
+    /// Computes a 64-bit non-zero hash over folder and item PIDLs independent of shift/clipboard state.
+    pub fn item_identity_hash(&self) -> u64 {
+        let mut hasher = FastHasher::default();
+        hasher.write_u8(u8::from(self.is_background));
+        hasher.write_usize(self.item_pidls.len());
+        let folder = self.folder_pidl.as_bytes();
+        hasher.write_usize(folder.len());
+        hasher.write(folder);
+        for item in &self.item_pidls {
+            let bytes = item.as_bytes();
+            hasher.write_usize(bytes.len());
+            hasher.write(bytes);
+        }
+        hasher.finish().max(1)
+    }
+
+    /// Returns the relative child PIDL pointer for the primary selected item if valid.
+    pub fn primary_child_pidl(&self) -> Option<*const ITEMIDLIST> {
+        let first = self.item_pidls.first()?;
+        unsafe {
+            if !ILIsParent(self.folder_pidl.0, first.0, true).as_bool() {
+                return None;
+            }
+            Some(ILFindLastID(first.0).cast_const())
+        }
+    }
+
     /// Serializes folder + item PIDLs into a caller-owned scratch buffer (`<= 16` items, `<= 16 KB`).
     pub fn serialize_pidls(&self, out: &mut Vec<u8>) -> bool {
         out.clear();
@@ -442,7 +472,11 @@ impl SelectionKey {
             _ => return false,
         };
         let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
-        unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) != DRIVE_REMOTE_TYPE }
+        let drive_type = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        matches!(
+            drive_type,
+            DRIVE_REMOVABLE_TYPE | DRIVE_FIXED_TYPE | DRIVE_CDROM_TYPE | DRIVE_RAMDISK_TYPE
+        )
     }
 
     pub fn from_paths(
@@ -1137,20 +1171,17 @@ pub fn item_matches_hidden(
         if rule.is_empty() {
             return false;
         }
-        if let Some(target_verb) = rule
-            .strip_prefix("verb:")
-            .or_else(|| rule.strip_prefix("VERB:"))
-        {
-            verb.is_some_and(|v| eq_ignore_case(v, target_verb.trim()))
-        } else if let Some(target_label) = rule
-            .strip_prefix("label:")
-            .or_else(|| rule.strip_prefix("LABEL:"))
-        {
-            !label.is_empty() && eq_ignore_case(label, target_label.trim())
-        } else {
-            verb.is_some_and(|v| eq_ignore_case(v, rule))
-                || (!label.is_empty() && eq_ignore_case(label, rule))
+        if let Some((prefix, rest)) = rule.split_once(':') {
+            if prefix.eq_ignore_ascii_case("verb") {
+                return verb.is_some_and(|v| eq_ignore_case(v, rest.trim()));
+            }
+            if prefix.eq_ignore_ascii_case("label") {
+                let target_label = rest.trim();
+                return !label.is_empty() && eq_ignore_case(label, target_label);
+            }
         }
+        verb.is_some_and(|v| eq_ignore_case(v, rule))
+            || (!label.is_empty() && eq_ignore_case(label, rule))
     })
 }
 
@@ -1488,10 +1519,12 @@ mod tests {
         );
         let rules = vec![
             "verb:PinToHomeFile".to_string(),
+            "Verb:Delete".to_string(),
             "label:メモ帳で編集".to_string(),
             "Send with Tailscale...".to_string(),
         ];
         assert!(item_matches_hidden(&rules, Some("pintohomefile"), "Pin to Favorites"));
+        assert!(item_matches_hidden(&rules, Some("delete"), "削除(D)"));
         assert!(item_matches_hidden(&rules, None, "メモ帳で編集"));
         assert!(item_matches_hidden(&rules, Some("tailscale"), "Send with Tailscale..."));
         assert!(!item_matches_hidden(&rules, Some("open"), "開く"));

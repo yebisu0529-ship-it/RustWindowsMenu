@@ -212,6 +212,36 @@ pub fn is_system_module(path: &Path) -> bool {
     system_windows_dir().is_some_and(|windows| is_core_system_module(path, windows))
 }
 
+/// Returns `true` for OS core system DLLs as well as built-in Windows Defender shell extensions.
+pub fn is_builtin_windows_handler(path: &Path) -> bool {
+    if is_system_module(path) {
+        return true;
+    }
+    let candidate = path.to_string_lossy();
+    let lower = candidate.to_ascii_lowercase();
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(root) = std::env::var_os(env_key) {
+            let prefix = format!(
+                "{}\\windows defender\\",
+                root.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase()
+            );
+            if lower.starts_with(&prefix) {
+                return true;
+            }
+        }
+    }
+    if let Some(root) = std::env::var_os("ProgramData") {
+        let prefix = format!(
+            "{}\\microsoft\\windows defender\\",
+            root.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase()
+        );
+        if lower.starts_with(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_core_system_module(path: &Path, windows: &Path) -> bool {
     let mut parts = path.iter();
     for part in windows.iter() {
@@ -264,5 +294,11 @@ mod tests {
             Path::new(r"C:\WindowsOther\System32\vendor.dll"),
             windows
         ));
+        assert!(is_builtin_windows_handler(Path::new(
+            r"C:\Program Files\Windows Defender\shellext.dll"
+        )));
+        assert!(!is_builtin_windows_handler(Path::new(
+            r"C:\Program Files\Vendor\ext.dll"
+        )));
     }
 }

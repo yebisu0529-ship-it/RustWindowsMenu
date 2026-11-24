@@ -1,10 +1,13 @@
 //! Dedicated STA daemon inside `rwm-host.exe` for speculative off-thread `NativeMenu` prebuilding
 //! and 1-5 ms right-click menu presentation. Never runs inside `explorer.exe`.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::os::windows::fs::MetadataExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -31,11 +34,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EndMenu, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, KillTimer, PeekMessageW, PostMessageW,
     RegisterClassExW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
     WindowFromPoint, GA_ROOT, GWLP_USERDATA, HC_ACTION, HHOOK, HWND_TOP, KBDLLHOOKSTRUCT,
-    LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WA_INACTIVE,
+    LWA_ALPHA, MSG, MSLLHOOKSTRUCT, PM_REMOVE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WA_INACTIVE,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CANCELMODE, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER,
     WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -47,8 +50,9 @@ const WM_APP_CANCEL_MENU: u32 = WM_APP + 3;
 const CACHE_PRUNE_TIMER: usize = 0x5257_4D50;
 const TRACK_WATCHDOG_TIMER: usize = 0x5257_4D51;
 const POPUP_CLASS_NAME: &str = "RustWindowsMenuPopup_v3";
-const MAX_PENDING_SHOW_AGE: Duration = Duration::from_millis(2000);
+const MAX_PENDING_SHOW_AGE: Duration = Duration::from_millis(400);
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(2000);
+const FILE_ATTRIBUTE_REPARSE_POINT_FLAG: u32 = 0x0400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadyKey {
@@ -107,9 +111,11 @@ impl<M> CacheCore<M> {
         self.entries.clear();
     }
 
-    fn prune_expired(&mut self, now: Instant) -> usize {
+    fn prune_expired(&mut self, now: Instant, reserved: Option<(u64, u32)>) -> usize {
         let before = self.entries.len();
-        self.entries.retain(|entry| entry.expires_at > now);
+        self.entries.retain(|entry| {
+            entry.expires_at > now || reserved == Some((entry.key_hash, entry.clipboard_seq))
+        });
         before - self.entries.len()
     }
 
@@ -121,13 +127,28 @@ impl<M> CacheCore<M> {
         })
     }
 
-    fn insert(&mut self, key_hash: u64, clipboard_seq: u32, menu: M, now: Instant, now_ms: u64) {
-        self.prune_expired(now);
+    fn insert(
+        &mut self,
+        key_hash: u64,
+        clipboard_seq: u32,
+        menu: M,
+        now: Instant,
+        now_ms: u64,
+        reserved: Option<(u64, u32)>,
+    ) {
+        self.prune_expired(now, reserved);
         if let Some(pos) = self.entries.iter().position(|e| e.key_hash == key_hash) {
             self.entries.remove(pos);
         }
         while self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
+            let evict_pos = self
+                .entries
+                .iter()
+                .position(|entry| reserved != Some((entry.key_hash, entry.clipboard_seq)));
+            let Some(pos) = evict_pos else {
+                break;
+            };
+            self.entries.remove(pos);
         }
         let ttl_ms = u64::try_from(self.ttl.as_millis()).unwrap_or(8_000);
         self.entries.push_back(CachedEntry {
@@ -140,7 +161,7 @@ impl<M> CacheCore<M> {
     }
 
     fn take(&mut self, key_hash: u64, clipboard_seq: u32, now: Instant) -> Option<CachedEntry<M>> {
-        self.prune_expired(now);
+        self.prune_expired(now, Some((key_hash, clipboard_seq)));
         let pos = self
             .entries
             .iter()
@@ -171,8 +192,8 @@ static TRACK_HOOK_POPUP: AtomicIsize = AtomicIsize::new(0);
 static TRACK_HOOK_OUTSIDE_CLICK: AtomicBool = AtomicBool::new(false);
 
 struct PopupWindowState {
-    menu: *const NativeMenu,
-    had_fg: bool,
+    menu: Cell<*const NativeMenu>,
+    had_fg: Cell<bool>,
 }
 
 struct PopupWindowGuard(HWND);
@@ -185,18 +206,18 @@ impl Drop for PopupWindowGuard {
     }
 }
 
-struct MenuBindingGuard<'a>(&'a mut PopupWindowState, PhantomData<&'a NativeMenu>);
+struct MenuBindingGuard<'a>(&'a PopupWindowState, PhantomData<&'a NativeMenu>);
 impl<'a> MenuBindingGuard<'a> {
-    fn bind(state: &'a mut PopupWindowState, menu: &'a NativeMenu, had_fg: bool) -> Self {
-        state.menu = std::ptr::from_ref(menu);
-        state.had_fg = had_fg;
+    fn bind(state: &'a PopupWindowState, menu: &'a NativeMenu, had_fg: bool) -> Self {
+        state.menu.set(std::ptr::from_ref(menu));
+        state.had_fg.set(had_fg);
         Self(state, PhantomData)
     }
 }
 impl Drop for MenuBindingGuard<'_> {
     fn drop(&mut self) {
-        self.0.menu = std::ptr::null();
-        self.0.had_fg = false;
+        self.0.menu.set(std::ptr::null());
+        self.0.had_fg.set(false);
     }
 }
 
@@ -472,7 +493,7 @@ impl MenuCacheWorker {
     }
 
     /// Sub-millisecond handoff gate run on `host.rs`'s window loop when Explorer sends `ClaimShow`.
-    pub fn on_claim_show_signal(&self) -> bool {
+    pub fn on_claim_show_signal(&self, expected_seq: u64) -> bool {
         if self.is_tracking.load(Ordering::Acquire) {
             self.cancel_active_menu();
             return false;
@@ -480,22 +501,21 @@ impl MenuCacheWorker {
         let Some(req) = self.shared_host.read_show() else {
             return false;
         };
+        if expected_seq != 0 && req.request_seq != expected_seq {
+            return false;
+        }
         let now = Instant::now();
         let accepted = {
             let mut state = self.coordinator.lock().unwrap_or_else(|e| e.into_inner());
             if self.is_tracking.load(Ordering::Acquire) {
                 false
             } else {
-                let is_in_flight = state.in_flight == Some((req.key_hash, req.clipboard_seq));
                 let is_ready = state.ready.iter().any(|entry| {
                     entry.key_hash == req.key_hash
                         && entry.clipboard_seq == req.clipboard_seq
                         && entry.expires_at > now
                 });
-                let is_queued = state.pending_prefetch.as_ref().is_some_and(|p| {
-                    p.key_hash == req.key_hash && p.clipboard_seq == req.clipboard_seq
-                });
-                if is_in_flight || is_ready || is_queued {
+                if is_ready {
                     state.pending_show = Some(PendingShow {
                         req,
                         received_at: now,
@@ -567,6 +587,9 @@ impl MenuCacheWorker {
     }
 
     fn stop_inner(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
         self.stop_requested.store(true, Ordering::Release);
         let raw = self.popup_hwnd.load(Ordering::Acquire);
         if raw != 0 {
@@ -580,6 +603,8 @@ impl MenuCacheWorker {
             if let Some(handle) = self.thread.take() {
                 let _ = handle.join();
             }
+        } else {
+            self.thread.take();
         }
     }
 }
@@ -597,19 +622,21 @@ unsafe extern "system" fn popup_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let handled = catch_unwind(AssertUnwindSafe(|| {
-        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupWindowState;
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const PopupWindowState;
         if !state.is_null() {
+            let state = &*state;
             if message == WM_APP_CANCEL_MENU {
                 let _ = EndMenu();
                 return Some(LRESULT(0));
             }
             if message == WM_TIMER && wparam.0 == TRACK_WATCHDOG_TIMER {
-                if !(*state).menu.is_null() && (*state).had_fg && GetForegroundWindow() != hwnd {
+                if !state.menu.get().is_null() && state.had_fg.get() && GetForegroundWindow() != hwnd
+                {
                     let _ = EndMenu();
                 }
                 return Some(LRESULT(0));
             }
-            let menu = (*state).menu;
+            let menu = state.menu.get();
             if !menu.is_null() {
                 if (message == WM_ACTIVATE && (wparam.0 & 0xFFFF) == WA_INACTIVE as usize)
                     || (message == WM_ACTIVATEAPP && wparam.0 == 0)
@@ -703,15 +730,15 @@ fn sta_thread_main(
         }
     };
     let popup_hwnd = popup_guard.0;
-    let mut win_state = Box::new(PopupWindowState {
-        menu: std::ptr::null(),
-        had_fg: false,
+    let win_state = Box::new(PopupWindowState {
+        menu: Cell::new(std::ptr::null()),
+        had_fg: Cell::new(false),
     });
     unsafe {
         SetWindowLongPtrW(
             popup_hwnd,
             GWLP_USERDATA,
-            std::ptr::from_mut(&mut *win_state) as isize,
+            std::ptr::from_ref(&*win_state) as isize,
         );
     }
     popup_hwnd_out.store(popup_hwnd.0 as isize, Ordering::Release);
@@ -765,13 +792,21 @@ fn sta_thread_main(
             sync_cache_views(&shared_host, &coordinator, &cache, None);
         }
         if msg.message == WM_TIMER && msg.wParam.0 == CACHE_PRUNE_TIMER {
-            if cache.prune_expired(Instant::now()) > 0 {
+            let reserved = {
+                coordinator
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending_show
+                    .as_ref()
+                    .map(|p| (p.req.key_hash, p.req.clipboard_seq))
+            };
+            if cache.prune_expired(Instant::now(), reserved) > 0 {
                 sync_cache_views(&shared_host, &coordinator, &cache, None);
             }
         } else if msg.message == WM_APP_PROCESS_WORK {
             process_work(
                 popup_hwnd,
-                &mut win_state,
+                &win_state,
                 &shared_host,
                 &coordinator,
                 &is_tracking,
@@ -833,10 +868,20 @@ fn sync_cache_views(
     shared_host.publish_slots(&slots);
 }
 
+fn is_reparse_entry(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_FLAG) != 0
+    })
+}
+
+fn has_reparse_point(path: &Path) -> bool {
+    is_reparse_entry(path) || path.parent().is_some_and(is_reparse_entry)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_work(
     popup_hwnd: HWND,
-    win_state: &mut PopupWindowState,
+    win_state: &PopupWindowState,
     shared_host: &SharedCacheHost,
     coordinator: &Mutex<CoordinatorState>,
     is_tracking: &AtomicBool,
@@ -872,10 +917,16 @@ fn process_work(
             state.pending_prefetch.take()
         };
         let Some(payload) = payload else {
-            // Drop stale pending_show when there is no cache hit and no queued/in-flight prefetch.
+            let now = Instant::now();
             let mut state = coordinator.lock().unwrap_or_else(|e| e.into_inner());
-            state.pending_show = None;
-            shared_host.set_pending_show(false);
+            let drop_pending = state.pending_show.as_ref().is_some_and(|p| {
+                now.saturating_duration_since(p.received_at) > MAX_PENDING_SHOW_AGE
+                    || !cache.contains(p.req.key_hash, p.req.clipboard_seq, now)
+            });
+            if drop_pending {
+                state.pending_show = None;
+                shared_host.set_pending_show(false);
+            }
             return;
         };
         if payload.request_seq <= *last_seq {
@@ -884,23 +935,17 @@ fn process_work(
         *last_seq = payload.request_seq;
 
         let now = Instant::now();
-        if cache.contains(payload.key_hash, payload.clipboard_seq, now) {
-            continue;
-        }
         let Ok(selection) =
             SelectionKey::from_serialized_pidls(&payload.pidl_bytes, payload.shift_held)
         else {
             continue;
         };
-        if !selection.is_local_filesystem() {
+        if !selection.is_local_filesystem() || selection.primary_fs_path().is_some_and(has_reparse_point)
+        {
             continue;
         }
         let current_clip = clipboard_sequence_number();
-        let effective_hash = if current_clip == payload.clipboard_seq {
-            payload.key_hash
-        } else {
-            selection.cache_key_hash(current_clip)
-        };
+        let effective_hash = selection.cache_key_hash(current_clip);
         if cache.contains(effective_hash, current_clip, now) {
             continue;
         }
@@ -925,12 +970,21 @@ fn process_work(
         match built {
             Ok(menu) => {
                 let built_now = Instant::now();
+                let reserved = {
+                    coordinator
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pending_show
+                        .as_ref()
+                        .map(|p| (p.req.key_hash, p.req.clipboard_seq))
+                };
                 cache.insert(
                     effective_hash,
                     current_clip,
                     menu,
                     built_now,
                     now_tick_ms(),
+                    reserved,
                 );
                 sync_cache_views(shared_host, coordinator, cache, None);
             }
@@ -1025,7 +1079,7 @@ fn activate_popup_owner(
 
 fn show_and_invoke(
     popup_hwnd: HWND,
-    win_state: &mut PopupWindowState,
+    win_state: &PopupWindowState,
     menu: &NativeMenu,
     req: &ShowRequest,
     is_tracking: &AtomicBool,
@@ -1034,19 +1088,47 @@ fn show_and_invoke(
     let root = HWND(req.explorer_root_hwnd as *mut c_void);
     let defview = HWND(req.defview_hwnd as *mut c_void);
 
-    let _tracking_guard = TrackingGuard::enter(is_tracking, shared_host);
+    let fg = unsafe { GetForegroundWindow() };
+    if !fg.is_invalid() && !root.is_invalid() && unsafe { IsWindow(root) }.as_bool() {
+        let fg_root = unsafe { GetAncestor(fg, GA_ROOT) };
+        if fg_root != root && fg_root != popup_hwnd {
+            shared_host.set_pending_show(false);
+            return;
+        }
+    }
+
+    unsafe {
+        let mut stale = MSG::default();
+        while PeekMessageW(
+            &mut stale,
+            popup_hwnd,
+            WM_APP_CANCEL_MENU,
+            WM_APP_CANCEL_MENU,
+            PM_REMOVE,
+        )
+        .as_bool()
+        {}
+        while PeekMessageW(&mut stale, popup_hwnd, WM_CANCELMODE, WM_CANCELMODE, PM_REMOVE)
+            .as_bool()
+        {}
+    }
+
+    let tracking_guard = TrackingGuard::enter(is_tracking, shared_host);
     shared_host.set_pending_show(false);
     let got_fg = activate_popup_owner(popup_hwnd, root, req.anchor_x, req.anchor_y);
     let binding = MenuBindingGuard::bind(win_state, menu, got_fg);
     let watchdog = got_fg.then(|| WatchdogTimerGuard::arm(popup_hwnd));
-    let dismiss_hooks = TrackDismissHookGuard::install(popup_hwnd);
+    let dismiss_hooks = (!got_fg).then(|| TrackDismissHookGuard::install(popup_hwnd));
 
     let selected = menu.track_only(popup_hwnd, (req.anchor_x, req.anchor_y), req.no_animation);
-    let dismissed_by_click = dismiss_hooks.dismissed_by_outside_click();
+    let dismissed_by_click = dismiss_hooks
+        .as_ref()
+        .is_some_and(TrackDismissHookGuard::dismissed_by_outside_click);
     let was_fg = unsafe { GetForegroundWindow() } == popup_hwnd;
     drop(dismiss_hooks);
     drop(watchdog);
     drop(binding);
+    drop(tracking_guard);
     unsafe {
         let _ = ShowWindow(popup_hwnd, SW_HIDE);
         let _ = PostMessageW(popup_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
@@ -1069,8 +1151,14 @@ fn show_and_invoke(
                 if was_fg {
                     focus_explorer(root);
                 }
+                let item_hash = menu.selection().item_identity_hash();
                 unsafe {
-                    let _ = PostMessageW(defview, edit_label_msg_id(), WPARAM(0), LPARAM(0));
+                    let _ = PostMessageW(
+                        defview,
+                        edit_label_msg_id(),
+                        WPARAM(item_hash as usize),
+                        LPARAM(0),
+                    );
                 }
             } else if let Err(error) = menu.invoke_id(cmd_id, popup_hwnd, (req.anchor_x, req.anchor_y))
             {
@@ -1123,22 +1211,24 @@ mod tests {
     fn cache_core_enforces_lru_ttl_and_clipboard_seq() {
         let mut cache = CacheCore::new(2, Duration::from_millis(500));
         let t0 = Instant::now();
-        cache.insert(1, 10, "one", t0, 1000);
-        cache.insert(2, 10, "two", t0, 1000);
-        cache.insert(3, 10, "three", t0, 1000);
-        assert!(!cache.contains(1, 10, t0));
+        cache.insert(1, 10, "one", t0, 1000, None);
+        cache.insert(2, 10, "two", t0, 1000, None);
+        cache.insert(3, 10, "three", t0, 1000, Some((2, 10)));
         assert!(cache.contains(2, 10, t0));
         assert!(cache.contains(3, 10, t0));
+        assert!(!cache.contains(1, 10, t0));
         // Wrong clipboard sequence never hits.
         assert!(!cache.contains(2, 11, t0));
         // Take consumes the entry (never reuse an HMENU twice).
         let got = cache.take(2, 10, t0).unwrap();
         assert_eq!(got.menu, "two");
         assert!(!cache.contains(2, 10, t0));
-        // TTL expires remaining entry.
-        assert!(!cache.contains(3, 10, t0 + Duration::from_millis(600)));
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.prune_expired(t0 + Duration::from_millis(600)), 1);
+        // Reserved entry survives prune_expired; unreserved expires.
+        assert_eq!(
+            cache.prune_expired(t0 + Duration::from_millis(600), Some((3, 10))),
+            0
+        );
+        assert_eq!(cache.prune_expired(t0 + Duration::from_millis(600), None), 1);
     }
 
     #[test]
@@ -1190,7 +1280,7 @@ mod tests {
     #[test]
     #[ignore = "hosts a real Menu STA thread and tests live popup foreground & dismissal"]
     fn sta_worker_menu_dismisses_on_cancel_and_foreground_loss() {
-        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE, WS_VISIBLE};
+        use windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
 
         let pump_messages = || {
             let mut msg = MSG::default();
@@ -1289,8 +1379,12 @@ mod tests {
             explorer_root_hwnd: dummy_hwnd.0 as isize,
             no_animation: true,
         };
-        assert!(client.try_write_show(&req).is_some());
-        assert!(worker.on_claim_show_signal());
+        let show_seq = client.try_write_show(&req).expect("show write");
+        assert!(
+            !worker.on_claim_show_signal(show_seq.wrapping_add(1)),
+            "claim with mismatched request_seq must be rejected"
+        );
+        assert!(worker.on_claim_show_signal(show_seq));
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while !worker.is_tracking.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -1302,8 +1396,9 @@ mod tests {
             "popup menu did not enter tracking"
         );
         assert!(client.is_host_tracking());
+        let cancel_seq = client.try_write_show(&req).expect("show write while tracking");
         assert!(
-            !worker.on_claim_show_signal(),
+            !worker.on_claim_show_signal(cancel_seq),
             "claim while tracking must be rejected & cancel"
         );
 
@@ -1321,8 +1416,8 @@ mod tests {
 
         // 2. Open popup menu again and verify inactivation / foreground loss dismisses it cleanly.
         prefetch_and_wait_ready();
-        assert!(client.try_write_show(&req).is_some());
-        assert!(worker.on_claim_show_signal());
+        let show_seq2 = client.try_write_show(&req).expect("second show write");
+        assert!(worker.on_claim_show_signal(show_seq2));
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while !worker.is_tracking.load(Ordering::Acquire) && Instant::now() < deadline {

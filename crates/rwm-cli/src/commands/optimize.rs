@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use rwm_core::handlers;
 use rwm_core::inspect::{HandlerTiming, InspectReport};
-use rwm_core::warm_pool::is_system_module;
+use rwm_core::ipc_cache::notify_host_config_reload;
+use rwm_core::warm_pool::is_builtin_windows_handler;
 use serde::Serialize;
 
 use crate::cli::{InspectArgs, OptimizeArgs};
@@ -62,6 +63,9 @@ pub fn run(args: &OptimizeArgs) -> CliResult<ExitCode> {
             handlers::block_clsid(&candidate.clsid, Some(&candidate.name))?;
             applied_blocks += 1;
         }
+        if applied_blocks > 0 {
+            notify_host_config_reload();
+        }
     }
 
     let report = OptimizeReport {
@@ -91,7 +95,7 @@ fn select_candidates(handlers: &[HandlerTiming], threshold_ms: f64) -> Vec<Optim
             handler
                 .dll_path
                 .as_deref()
-                .is_none_or(|path| !is_system_module(path))
+                .is_none_or(|path| !is_builtin_windows_handler(path))
         })
         .filter_map(|handler| {
             let ms = handler.warm_ms?;

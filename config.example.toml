@@ -1,4 +1,4 @@
-# RustWindowsMenu v0.4.0 configuration
+# RustWindowsMenu v0.4.1 configuration
 # Copy to %APPDATA%\RustWindowsMenu\config.toml or run `rwm config init`.
 # Emergency kill switch: create an empty file at %LOCALAPPDATA%\RustWindowsMenu\DISABLE_HOOK.
 
@@ -8,7 +8,7 @@ enabled = true
 # Build the native menu as soon as the right mouse button is pressed.
 prebuild_on_rbuttondown = true
 
-# Delay before arming the in-process fallback prebuilder, in milliseconds (1-100).
+# Delay before arming the in-process fallback prebuilder, in milliseconds (0-100).
 arm_delay_ms = 15
 
 # Disable popup animation for instant visual presentation.

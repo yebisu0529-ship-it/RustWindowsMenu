@@ -5,13 +5,21 @@ use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, HANDLE, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, STILL_ACTIVE, WPARAM,
+};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, RegisterWindowMessageW};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowThreadProcessId, IsWindow, PostMessageW, RegisterWindowMessageW,
+};
 use windows_core::PCWSTR;
 
 use crate::build_info::ABI_VERSION;
@@ -21,7 +29,6 @@ pub const SHARED_CACHE_NAME: &str = r"Local\RustWindowsMenu_Cache_v3";
 pub const CACHE_MAGIC: u32 = 0x5257_4D33; // "RWM3"
 pub const MAX_READY_SLOTS: usize = 8;
 pub const MAX_PREFETCH_BYTES: usize = 16 * 1024;
-const STALE_LOCK_MS: u64 = 250;
 const HOST_STATE_TRACKING: u32 = 1 << 0;
 const HOST_STATE_PENDING_SHOW: u32 = 1 << 1;
 
@@ -107,7 +114,7 @@ struct PrefetchSlot {
     payload_len: AtomicU32,
     request_seq: AtomicU64,
     key_hash: AtomicU64,
-    lock_tick_ms: AtomicU64,
+    _reserved_tick_ms: AtomicU64,
     payload: UnsafeCell<[u8; MAX_PREFETCH_BYTES]>,
 }
 
@@ -120,7 +127,7 @@ struct ShowSlot {
     defview_hwnd: AtomicU64,
     explorer_root_hwnd: AtomicU64,
     request_seq: AtomicU64,
-    lock_tick_ms: AtomicU64,
+    _reserved_tick_ms: AtomicU64,
     anchor_x: AtomicI32,
     anchor_y: AtomicI32,
     no_animation: AtomicU32,
@@ -213,38 +220,92 @@ impl Drop for MappingView {
     }
 }
 
-struct WriteLockGuard<'a> {
-    lock: &'a AtomicU32,
+fn is_process_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            let mut code = 0u32;
+            let ok = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            ok && code != STILL_ACTIVE.0 as u32
+        }
+        Err(err) => err.code() == ERROR_INVALID_PARAMETER.to_hresult(),
+    }
 }
 
-impl<'a> WriteLockGuard<'a> {
-    fn try_acquire(lock: &'a AtomicU32, lock_tick_ms: &AtomicU64) -> Option<Self> {
-        let now = now_tick_ms();
+struct SlotLockGuard<'a> {
+    lock: &'a AtomicU32,
+    owner_pid: u32,
+}
+
+impl<'a> SlotLockGuard<'a> {
+    fn try_acquire(lock: &'a AtomicU32) -> Option<(Self, bool)> {
+        let my_pid = unsafe { GetCurrentProcessId() }.max(1);
         if lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, my_pid, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            lock_tick_ms.store(now, Ordering::Relaxed);
-            return Some(Self { lock });
+            return Some((
+                Self {
+                    lock,
+                    owner_pid: my_pid,
+                },
+                false,
+            ));
         }
-        // Recover cleanly if another Explorer thread died or stalled mid-write.
-        let owned_at = lock_tick_ms.load(Ordering::Relaxed);
-        if owned_at != 0
-            && now.saturating_sub(owned_at) > STALE_LOCK_MS
-            && lock_tick_ms
-                .compare_exchange(owned_at, now, Ordering::Acquire, Ordering::Relaxed)
+        let owner = lock.load(Ordering::Relaxed);
+        if owner != 0
+            && owner != my_pid
+            && is_process_dead(owner)
+            && lock
+                .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
-            return Some(Self { lock });
+            return Some((
+                Self {
+                    lock,
+                    owner_pid: my_pid,
+                },
+                true,
+            ));
         }
         None
     }
 }
 
-impl Drop for WriteLockGuard<'_> {
+impl Drop for SlotLockGuard<'_> {
     fn drop(&mut self) {
-        self.lock.store(0, Ordering::Release);
+        let _ =
+            self.lock
+                .compare_exchange(self.owner_pid, 0, Ordering::Release, Ordering::Relaxed);
     }
+}
+
+fn try_acquire_spin(lock: &AtomicU32, spins: usize) -> Option<(SlotLockGuard<'_>, bool)> {
+    for _ in 0..spins {
+        if let Some(acquired) = SlotLockGuard::try_acquire(lock) {
+            return Some(acquired);
+        }
+        std::hint::spin_loop();
+    }
+    None
+}
+
+fn try_acquire_wait(lock: &AtomicU32, max_sleep_ms: u32) -> Option<(SlotLockGuard<'_>, bool)> {
+    if let Some(acquired) = try_acquire_spin(lock, 32) {
+        return Some(acquired);
+    }
+    for _ in 0..max_sleep_ms {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Some(acquired) = SlotLockGuard::try_acquire(lock) {
+            return Some(acquired);
+        }
+    }
+    None
 }
 
 /// Owns the named shared-memory cache region inside `rwm-host.exe`.
@@ -270,12 +331,40 @@ impl SharedCacheHost {
                 PCWSTR(wide.as_ptr()),
             )?
         };
+        let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         let mapping = unsafe { MappingView::from_handle(handle)? };
-        unsafe {
-            ptr::write_bytes(mapping.view.Value.cast::<u8>(), 0, size as usize);
-        }
         let region = mapping.region();
-        region.next_request_seq.store(1, Ordering::Relaxed);
+        if !already_exists {
+            unsafe {
+                ptr::write_bytes(mapping.view.Value.cast::<u8>(), 0, size as usize);
+            }
+            region.next_request_seq.store(1, Ordering::Relaxed);
+        } else {
+            // Another client still holds the section open across host restart: take slot locks
+            // rather than zeroing atomics out from under an active Explorer writer.
+            region.magic.store(0, Ordering::Release);
+            region.host_pid.store(0, Ordering::Release);
+            region.host_hwnd.store(0, Ordering::Release);
+            let _prefetch_guard = try_acquire_wait(&region.prefetch.lock, 50);
+            let _show_guard = try_acquire_wait(&region.show.lock, 50);
+            region.host_tracking.store(0, Ordering::Release);
+            region.in_flight_hash.store(0, Ordering::Release);
+            for slot in &region.slots {
+                slot.key_hash.store(0, Ordering::Release);
+                slot.expires_tick_ms.store(0, Ordering::Release);
+            }
+            if _prefetch_guard.is_some() {
+                region.prefetch.seq.store(0, Ordering::Release);
+                region.prefetch.payload_len.store(0, Ordering::Release);
+            }
+            if _show_guard.is_some() {
+                region.show.seq.store(0, Ordering::Release);
+                region.show.key_hash.store(0, Ordering::Release);
+            }
+            if region.next_request_seq.load(Ordering::Relaxed) == 0 {
+                region.next_request_seq.store(1, Ordering::Relaxed);
+            }
+        }
         region.abi_version.store(ABI_VERSION, Ordering::Release);
         region.magic.store(CACHE_MAGIC, Ordering::Release);
         Ok(Self { mapping })
@@ -332,73 +421,87 @@ impl SharedCacheHost {
         }
     }
 
-    /// Reads the latest prefetch payload without blocking writers, returning `None` on torn reads.
+    /// Reads the latest prefetch payload under the slot lock, discarding any partial dead-writer record.
     pub fn read_prefetch(&self) -> Option<PrefetchPayload> {
         let slot = &self.mapping.region().prefetch;
-        for _ in 0..4 {
-            let seq1 = slot.seq.load(Ordering::Acquire);
-            if seq1 == 0 || (seq1 & 1) != 0 {
-                std::hint::spin_loop();
-                continue;
+        let (_guard, recovered) = try_acquire_spin(&slot.lock, 8)?;
+        if recovered {
+            slot.payload_len.store(0, Ordering::Release);
+            let cur = slot.seq.load(Ordering::Relaxed);
+            if (cur & 1) != 0 {
+                slot.seq.store(cur.wrapping_add(1), Ordering::Release);
             }
-            let len = slot.payload_len.load(Ordering::Relaxed) as usize;
-            if len == 0 || len > MAX_PREFETCH_BYTES {
-                return None;
-            }
-            let request_seq = slot.request_seq.load(Ordering::Relaxed);
-            let key_hash = slot.key_hash.load(Ordering::Relaxed);
-            let shift_held = slot.shift_held.load(Ordering::Relaxed) != 0;
-            let clipboard_seq = slot.clipboard_seq.load(Ordering::Relaxed);
-            let mut pidl_bytes = vec![0u8; len];
-            fence(Ordering::Acquire);
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    slot.payload.get().cast::<u8>(),
-                    pidl_bytes.as_mut_ptr(),
-                    len,
-                );
-            }
-            fence(Ordering::Acquire);
-            let seq2 = slot.seq.load(Ordering::Acquire);
-            if seq1 == seq2 {
-                return Some(PrefetchPayload {
-                    request_seq,
-                    key_hash,
-                    shift_held,
-                    clipboard_seq,
-                    pidl_bytes,
-                });
-            }
+            return None;
         }
-        None
+        let seq1 = slot.seq.load(Ordering::Acquire);
+        if seq1 == 0 || (seq1 & 1) != 0 {
+            return None;
+        }
+        let len = slot.payload_len.load(Ordering::Relaxed) as usize;
+        if len == 0 || len > MAX_PREFETCH_BYTES {
+            return None;
+        }
+        let request_seq = slot.request_seq.load(Ordering::Relaxed);
+        let key_hash = slot.key_hash.load(Ordering::Relaxed);
+        let shift_held = slot.shift_held.load(Ordering::Relaxed) != 0;
+        let clipboard_seq = slot.clipboard_seq.load(Ordering::Relaxed);
+        let mut pidl_bytes = vec![0u8; len];
+        fence(Ordering::Acquire);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                slot.payload.get().cast::<u8>(),
+                pidl_bytes.as_mut_ptr(),
+                len,
+            );
+        }
+        fence(Ordering::Acquire);
+        let seq2 = slot.seq.load(Ordering::Acquire);
+        if seq1 == seq2 {
+            Some(PrefetchPayload {
+                request_seq,
+                key_hash,
+                shift_held,
+                clipboard_seq,
+                pidl_bytes,
+            })
+        } else {
+            None
+        }
     }
 
-    /// Reads the latest click-show handoff request without blocking, returning `None` on torn reads.
+    /// Reads the latest click-show handoff request under the slot lock, discarding dead-writer records.
     pub fn read_show(&self) -> Option<ShowRequest> {
         let slot = &self.mapping.region().show;
-        for _ in 0..4 {
-            let seq1 = slot.seq.load(Ordering::Acquire);
-            if seq1 == 0 || (seq1 & 1) != 0 {
-                std::hint::spin_loop();
-                continue;
+        let (_guard, recovered) = try_acquire_spin(&slot.lock, 8)?;
+        if recovered {
+            slot.key_hash.store(0, Ordering::Release);
+            let cur = slot.seq.load(Ordering::Relaxed);
+            if (cur & 1) != 0 {
+                slot.seq.store(cur.wrapping_add(1), Ordering::Release);
             }
-            let request = ShowRequest {
-                request_seq: slot.request_seq.load(Ordering::Relaxed),
-                key_hash: slot.key_hash.load(Ordering::Relaxed),
-                clipboard_seq: slot.clipboard_seq.load(Ordering::Relaxed),
-                anchor_x: slot.anchor_x.load(Ordering::Relaxed),
-                anchor_y: slot.anchor_y.load(Ordering::Relaxed),
-                defview_hwnd: slot.defview_hwnd.load(Ordering::Relaxed) as isize,
-                explorer_root_hwnd: slot.explorer_root_hwnd.load(Ordering::Relaxed) as isize,
-                no_animation: slot.no_animation.load(Ordering::Relaxed) != 0,
-            };
-            fence(Ordering::Acquire);
-            let seq2 = slot.seq.load(Ordering::Acquire);
-            if seq1 == seq2 && request.key_hash != 0 {
-                return Some(request);
-            }
+            return None;
         }
-        None
+        let seq1 = slot.seq.load(Ordering::Acquire);
+        if seq1 == 0 || (seq1 & 1) != 0 {
+            return None;
+        }
+        let request = ShowRequest {
+            request_seq: slot.request_seq.load(Ordering::Relaxed),
+            key_hash: slot.key_hash.load(Ordering::Relaxed),
+            clipboard_seq: slot.clipboard_seq.load(Ordering::Relaxed),
+            anchor_x: slot.anchor_x.load(Ordering::Relaxed),
+            anchor_y: slot.anchor_y.load(Ordering::Relaxed),
+            defview_hwnd: slot.defview_hwnd.load(Ordering::Relaxed) as isize,
+            explorer_root_hwnd: slot.explorer_root_hwnd.load(Ordering::Relaxed) as isize,
+            no_animation: slot.no_animation.load(Ordering::Relaxed) != 0,
+        };
+        fence(Ordering::Acquire);
+        let seq2 = slot.seq.load(Ordering::Acquire);
+        if seq1 == seq2 && request.key_hash != 0 {
+            Some(request)
+        } else {
+            None
+        }
     }
 }
 
@@ -451,6 +554,21 @@ impl SharedCacheClient {
         self.mapping.region().host_hwnd.load(Ordering::Acquire) as isize
     }
 
+    /// Verifies that the published host HWND is alive and belongs to `host_pid`.
+    pub fn live_host_target(&self) -> Option<(u32, HWND)> {
+        if !self.is_valid() {
+            return None;
+        }
+        let pid = self.host_pid();
+        let hwnd = HWND(self.host_hwnd() as *mut c_void);
+        if pid == 0 || hwnd.is_invalid() || !unsafe { IsWindow(hwnd) }.as_bool() {
+            return None;
+        }
+        let mut owner_pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid)) };
+        (owner_pid == pid).then_some((pid, hwnd))
+    }
+
     /// Lock-free check whether `rwm-host.exe` currently has an active context menu open.
     #[inline]
     pub fn is_host_tracking(&self) -> bool {
@@ -492,7 +610,7 @@ impl SharedCacheClient {
         }
         let region = self.mapping.region();
         let slot = &region.prefetch;
-        let _guard = WriteLockGuard::try_acquire(&slot.lock, &slot.lock_tick_ms)?;
+        let (_guard, _) = SlotLockGuard::try_acquire(&slot.lock)?;
         let request_seq = region.next_request_seq.fetch_add(1, Ordering::Relaxed);
         let prev = slot.seq.load(Ordering::Relaxed);
         let odd = prev.wrapping_add(1) | 1;
@@ -524,15 +642,7 @@ impl SharedCacheClient {
         }
         let region = self.mapping.region();
         let slot = &region.show;
-        let mut guard = None;
-        for _ in 0..32 {
-            if let Some(acquired) = WriteLockGuard::try_acquire(&slot.lock, &slot.lock_tick_ms) {
-                guard = Some(acquired);
-                break;
-            }
-            std::hint::spin_loop();
-        }
-        let _guard = guard?;
+        let (_guard, _) = try_acquire_spin(&slot.lock, 32)?;
         let request_seq = region.next_request_seq.fetch_add(1, Ordering::Relaxed);
         let prev = slot.seq.load(Ordering::Relaxed);
         let odd = prev.wrapping_add(1) | 1;
@@ -660,5 +770,39 @@ mod tests {
         assert!(host.read_prefetch().is_none());
         host.mapping.region().show.seq.store(5, Ordering::Release);
         assert!(host.read_show().is_none());
+    }
+
+    #[test]
+    fn host_restart_reinitializes_open_mapping_and_recovers_dead_pid_lock() {
+        let name = unique_mapping();
+        let host1 = SharedCacheHost::create_named(&name).unwrap();
+        host1.set_host_info(1111, 0x1111);
+        let client = SharedCacheClient::open_named(&name).unwrap();
+        assert!(client.try_write_prefetch(0x1234, false, 1, &[1, 2, 3]).is_some());
+
+        // Simulate abrupt host restart while client still holds the section open.
+        drop(host1);
+        assert!(!client.is_valid());
+        let host2 = SharedCacheHost::create_named(&name).unwrap();
+        host2.set_host_info(2222, 0x2222);
+        assert!(client.is_valid());
+        assert_eq!(client.host_pid(), 2222);
+        assert!(host2.read_prefetch().is_none());
+
+        // Simulate a dead writer PID leaving the slot lock held with a partial odd record.
+        let dead_pid = u32::MAX - 3;
+        let region = host2.mapping.region();
+        region.prefetch.lock.store(dead_pid, Ordering::Release);
+        region.prefetch.seq.store(7, Ordering::Release);
+        region.prefetch.payload_len.store(4, Ordering::Release);
+        assert!(host2.read_prefetch().is_none());
+        assert_eq!(region.prefetch.lock.load(Ordering::Acquire), 0);
+        assert_eq!(region.prefetch.seq.load(Ordering::Acquire) & 1, 0);
+
+        // Fresh write succeeds after dead-owner recovery.
+        assert!(client.try_write_prefetch(0x9999, false, 2, &[9, 8]).is_some());
+        let read = host2.read_prefetch().unwrap();
+        assert_eq!(read.key_hash, 0x9999);
+        assert_eq!(read.pidl_bytes, vec![9, 8]);
     }
 }
