@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod explorer;
+pub mod gui;
 pub mod hookdll;
 pub mod host;
 pub mod menu_cache;

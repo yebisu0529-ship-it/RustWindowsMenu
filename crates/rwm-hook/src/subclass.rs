@@ -7,16 +7,28 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use rwm_core::config::RwmConfig;
+use rwm_core::config::{local_data_dir, RwmConfig};
 use rwm_core::ipc_cache::{
     claim_show_msg_id, now_tick_ms, prefetch_msg_id, SharedCacheClient, ShowRequest,
 };
-use rwm_core::shell::{clipboard_sequence_number, NativeMenu, SelectionKey, ShellError};
+use rwm_core::shell::{
+    clipboard_sequence_number, NativeMenu, SelectionKey, ShellError, CUSTOMIZE_MENU_CMD_ID,
+};
 use rwm_core::warm_pool::WarmDllPin;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::UpdateWindow;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
@@ -936,9 +948,10 @@ fn build_menu_in_phase(
         && with_state(|state| state.warm.as_ref().is_none_or(WarmDllPin::should_snapshot))
             == Some(true);
     let before = need_pin.then(WarmDllPin::snapshot_loaded_modules);
-    let menu =
-        NativeMenu::build_from_view(&view.view, view.folder_view.as_ref(), background, shift);
-    let menu = menu.ok()?;
+    let mut menu =
+        NativeMenu::build_from_view(&view.view, view.folder_view.as_ref(), background, shift)
+            .ok()?;
+    menu.apply_customizations(config);
     if let Some(before) = before {
         with_state(|state| {
             let warm = state
@@ -948,6 +961,65 @@ fn build_menu_in_phase(
         });
     }
     Some(menu)
+}
+
+fn resolve_host_exe_path() -> Option<PathBuf> {
+    let mut module = HMODULE::default();
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(resolve_host_exe_path as *const u16),
+            &mut module,
+        )
+    };
+    if ok.is_ok() && !module.is_invalid() {
+        let mut buf = vec![0u16; 512];
+        loop {
+            let len = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
+            if len == 0 {
+                break;
+            }
+            if len < buf.len() {
+                let dll_path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+                if let Some(dll_dir) = dll_path.parent() {
+                    let sibling = dll_dir.join("rwm-host.exe");
+                    if sibling.is_file() {
+                        return Some(sibling);
+                    }
+                    if let Some(install_root) = dll_dir.parent().and_then(Path::parent) {
+                        let installed = install_root.join("bin").join("rwm-host.exe");
+                        if installed.is_file() {
+                            return Some(installed);
+                        }
+                    }
+                }
+                break;
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+    let fallback = local_data_dir().join("bin").join("rwm-host.exe");
+    fallback.is_file().then_some(fallback)
+}
+
+fn launch_manager_ui(selection: &SelectionKey) {
+    let Some(host_exe) = resolve_host_exe_path() else {
+        return;
+    };
+    let mut command = Command::new(host_exe);
+    command.arg("--ui");
+    if selection.is_background() {
+        command.arg("--background");
+    }
+    if let Some(path) = selection.primary_fs_path() {
+        command.arg("--target").arg(path);
+    }
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .spawn();
 }
 
 fn try_claim_host_show(
@@ -1007,7 +1079,7 @@ fn try_claim_host_show(
 enum ContextDecision {
     Fallback,
     HandledByHost,
-    ShowLocal(NativeMenu, POINT),
+    ShowLocal(Box<NativeMenu>, POINT),
 }
 
 /// Shows the native menu for one `WM_CONTEXTMENU`. `None` leaves the message to Explorer.
@@ -1090,7 +1162,7 @@ fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> 
             },
         };
         drop(building);
-        ContextDecision::ShowLocal(menu, anchor)
+        ContextDecision::ShowLocal(Box::new(menu), anchor)
     })();
 
     let outcome = match decision {
@@ -1099,7 +1171,16 @@ fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> 
         ContextDecision::ShowLocal(menu, anchor) => {
             let tracking = PhaseGuard::tracking(defview, &menu);
             let result = tracking.map(|_tracking| {
-                menu.track_and_invoke(defview, (anchor.x, anchor.y), config.no_animation)
+                match menu.track_only(defview, (anchor.x, anchor.y), config.no_animation)? {
+                    Some(cmd_id) if cmd_id == CUSTOMIZE_MENU_CMD_ID => {
+                        launch_manager_ui(menu.selection());
+                        Ok(Some(cmd_id))
+                    }
+                    Some(cmd_id) => menu
+                        .invoke_id(cmd_id, defview, (anchor.x, anchor.y))
+                        .map(|()| Some(cmd_id)),
+                    None => Ok(None),
+                }
             });
             drop(menu);
             match result {

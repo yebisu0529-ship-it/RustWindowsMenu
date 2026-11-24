@@ -54,6 +54,10 @@ pub struct RwmConfig {
     pub host_cache_entries: usize,
     #[serde(default = "default_host_cache_ttl")]
     pub host_cache_ttl_ms: u32,
+    #[serde(default = "default_true")]
+    pub show_customize_entry: bool,
+    #[serde(default)]
+    pub hidden_items: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -92,6 +96,8 @@ impl Default for RwmConfig {
             host_menu_cache: default_true(),
             host_cache_entries: default_host_cache_entries(),
             host_cache_ttl_ms: default_host_cache_ttl(),
+            show_customize_entry: default_true(),
+            hidden_items: Vec::new(),
         }
     }
 }
@@ -174,6 +180,20 @@ impl RwmConfig {
         self.hover_delay_ms = self.hover_delay_ms.clamp(40, 1000);
         self.host_cache_entries = self.host_cache_entries.clamp(1, 16);
         self.host_cache_ttl_ms = self.host_cache_ttl_ms.clamp(1000, 30000);
+        let mut seen = Vec::with_capacity(self.hidden_items.len());
+        let mut normalized = Vec::with_capacity(self.hidden_items.len());
+        for item in self.hidden_items {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            if !seen.contains(&lower) {
+                seen.push(lower);
+                normalized.push(trimmed.to_owned());
+            }
+        }
+        self.hidden_items = normalized;
         self
     }
 
@@ -219,6 +239,22 @@ mod tests {
         assert_eq!(config.hover_delay_ms, 40);
         assert_eq!(config.host_cache_entries, 16);
         assert_eq!(config.host_cache_ttl_ms, 30000);
+        let raw = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<RwmConfig>(&raw).unwrap(), config);
+    }
+
+    #[test]
+    fn hidden_items_normalize_and_show_customize_roundtrips() {
+        let config = toml::from_str::<RwmConfig>(
+            "show_customize_entry = false\nhidden_items = [\"  verb:Share \", \"\", \"VERB:share\", \"label:メモ帳で編集\", \"label:メモ帳で編集\"]",
+        )
+        .unwrap()
+        .validated();
+        assert!(!config.show_customize_entry);
+        assert_eq!(
+            config.hidden_items,
+            vec!["verb:Share".to_string(), "label:メモ帳で編集".to_string()]
+        );
         let raw = toml::to_string_pretty(&config).unwrap();
         assert_eq!(toml::from_str::<RwmConfig>(&raw).unwrap(), config);
     }

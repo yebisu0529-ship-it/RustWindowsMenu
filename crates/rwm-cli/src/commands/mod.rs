@@ -27,6 +27,21 @@ pub fn dispatch(command: Command) -> CliResult<ExitCode> {
         Command::Inspect(args) => inspect::run(&args),
         Command::Optimize(args) => optimize::run(&args),
         Command::Preview(args) => preview::run(&args),
+        Command::Ui(args) => {
+            let resolved = if args.target.path.is_some() || args.target.background {
+                let target = crate::target::resolve(&args.target)?;
+                (Some(target.path), target.background)
+            } else {
+                (None, false)
+            };
+            if args.wait {
+                crate::gui::run(resolved.0, resolved.1)
+            } else if crate::gui::spawn_manager(resolved.0.as_deref(), resolved.1).is_ok() {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                crate::gui::run(resolved.0, resolved.1)
+            }
+        }
         Command::Handlers { action } => handlers::run(action),
         Command::Classic { action } => classic::run(action),
         Command::Config { action } => config::run(action),

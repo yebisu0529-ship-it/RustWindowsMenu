@@ -1,4 +1,4 @@
-# RustWindowsMenu (`rwm`) v0.3.0
+# RustWindowsMenu (`rwm`) v0.4.0
 
 [English](#english) | [日本語](#japanese)
 
@@ -51,7 +51,18 @@ Verified with a custom `GlobalAlloc` counter harness in [hotpath_cost.rs](crates
 | `WarmDllPin::probe_module_bytes` | `13.8445 us` | `0.00 allocs` |
 | Map lookup (`FastHasher` vs `SipHash`) | `1.50 ns/op` vs `6.15 ns/op` | `0.00 allocs` |
 
-### What Changed in v0.3.0
+### What's New in v0.4.0
+
+1. **Right-Click Launcher + Native Context Menu Manager GUI (`rwm ui` / `rwm-host.exe --ui`)**:
+   - Click **"Customize Menu (RWM)..."** / **"メニューをカスタマイズ (RWM)..."** at the bottom of any File Explorer right-click menu, click the `rwm-host.exe` tray icon, or run `rwm ui [PATH] [--background]`.
+   - **Tab 1 (Menu Items)**: Check/uncheck individual top-level commands or submenus (`verb:...` / `label:...` stored in `hidden_items` in `config.toml`), search/filter live, prune orphan separators cleanly, test via `Preview Menu`, and notify the cached STA worker immediately (`RustWindowsMenu.ConfigReload.v3`).
+   - **Tab 2 (Shell Extensions)**: Shows measured query latency (ms) per handler, highlights slow third-party handlers (`>= 25 ms`), warns before touching Microsoft system DLLs, and lets you toggle or batch-disable slow handlers in one click.
+   - **Tab 3 (Settings)**: Toggle RWM feature flags, inspect host/ABI status, or open/reset `config.toml`.
+   - Automatic Windows 11 Dark/Light theme styling (`DWMWA_USE_IMMERSIVE_DARK_MODE`), Per-Monitor DPI v2, and single-instance focus switching.
+2. **System Tray Icon (`rwm-host.exe`)**:
+   - Left-click opens the Context Menu Manager directly; right-click offers Pause/Resume, Open Manager, or Exit Host.
+
+### What Changed in v0.3.0 (Included in v0.4.0)
 
 1. **Off-UI-Thread Speculative Cache (`rwm-host.exe` Menu STA Thread)**:
    - Dedicated STA worker thread with `SetThreadDpiAwarenessContext`, dark-mode menu support, hidden `WS_POPUP | WS_EX_TOOLWINDOW` popup owner, and an LRU + TTL + clipboard-sequence cache (`CacheCore`).
@@ -106,7 +117,8 @@ rwm doctor [PATH] [--background] [--json]
 rwm inspect [PATH] [--background] [--extended] [--json]
 rwm bench [PATH] [--background] [--runs N] [--json]
 rwm optimize [PATH] [--background] [--threshold-ms MS] [--apply] [--json]
-rwm preview [PATH] [--background] [--extended] [--no-animation]
+rwm preview [PATH] [--background] [--extended] [--no-animation] [--raw]
+rwm ui [PATH] [--background] [--wait]
 rwm handlers list [--json] | block <CLSID> [--name LABEL] | unblock <CLSID> [--force] | reset
 rwm classic status [--json] | enable [--restart] | disable [--force] [--restart]
 rwm config path | show | init [--force] | reset
@@ -131,6 +143,8 @@ selection_prebuild = true
 host_menu_cache = true
 host_cache_entries = 6
 host_cache_ttl_ms = 8000
+show_customize_entry = true
+hidden_items = []
 ```
 
 ---
@@ -174,7 +188,18 @@ OS 標準項目、MSIX パッケージ動詞 (12 個)、サードパーティ CO
 | `WarmDllPin::probe_module_bytes` | `13.8445 us` | `0.00 allocs` |
 | Map 参照 (`FastHasher` vs `SipHash`) | `1.50 ns/op` vs `6.15 ns/op` | `0.00 allocs` |
 
-### v0.3.0 の主な高速化内容
+### v0.4.0 の新機能 (右クリック管理 GUI・項目フィルタ・トレイアイコン)
+
+1. **右クリックから直接開ける管理画面 (`rwm ui` / `rwm-host.exe --ui`)**:
+   - ファイルやフォルダの右クリックメニュー最下部の **「メニューをカスタマイズ (RWM)...」**、`rwm-host.exe` のタスクトレイアイコン、または `rwm ui [PATH] [--background]` から開けます。
+   - **タブ 1 (表示するメニュー項目)**: コマンド・サブメニュー単位でチェックボックスから表示/非表示を切り替え (`config.toml` の `hidden_items`)、残った不要な区切り線を自動整理し、投機キャッシュへ即時反映します。
+   - **タブ 2 (シェル拡張・高速化)**: ハンドラごとの実測クエリ時間 (ms) を表示し、遅延の原因となるサードパーティ拡張を 1 クリックまたは一括で無効化/再有効化できます (Microsoft 標準 DLL は確認ダイアログ付き)。
+   - **タブ 3 (動作設定)**: RWM の各種設定トグル、`rwm-host` 稼働状態の確認、`config.toml` の表示・初期化を行えます。
+   - Windows 11 ダーク/ライトテーマ自動追従、Per-Monitor DPI v2、単一インスタンス対応。
+2. **タスクトレイアイコン (`rwm-host.exe`)**:
+   - 左クリックで管理画面をすぐに開き、右クリックから一時停止/再開・終了を操作できます。
+
+### v0.3.0 からの高速化基盤 (v0.4.0 に内蔵)
 
 1. **専用 Menu STA スレッドによるオフスレッド投機キャッシュ (`rwm-host.exe`)**:
    - `SetThreadDpiAwarenessContext`、ダークモードメニュー対応、非表示 `WS_POPUP | WS_EX_TOOLWINDOW` オーナー、LRU + TTL + クリップボード変更検知キャッシュ (`CacheCore`) を独立 STA スレッドに実装。

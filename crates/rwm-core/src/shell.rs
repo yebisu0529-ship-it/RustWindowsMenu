@@ -37,15 +37,17 @@ use windows::Win32::UI::Shell::{
     SVGIO_SELECTION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GetMenuDefaultItem, GetMenuItemCount, GetMenuItemInfoW,
-    SystemParametersInfoW, TrackPopupMenuEx, GMDI_USEDISABLED, HMENU, MENUITEMINFOW, MFS_CHECKED,
-    MFS_DISABLED, MFT_BITMAP, MFT_OWNERDRAW, MFT_SEPARATOR, MIIM_BITMAP, MIIM_CHECKMARKS,
+    AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetMenuDefaultItem, GetMenuItemCount,
+    GetMenuItemInfoW, RemoveMenu, SystemParametersInfoW, TrackPopupMenuEx, GMDI_USEDISABLED, HMENU,
+    MENUITEMINFOW, MF_BYPOSITION, MFS_CHECKED, MFS_DISABLED, MFT_BITMAP, MFT_OWNERDRAW,
+    MFT_SEPARATOR, MF_SEPARATOR as WMF_SEPARATOR, MF_STRING, MIIM_BITMAP, MIIM_CHECKMARKS,
     MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, SPI_GETHIGHCONTRAST, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_NOANIMATION, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_DRAWITEM,
     WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 use windows_core::{w, Interface, PCSTR, PCWSTR, PSTR, PWSTR};
 
+use crate::config::RwmConfig;
 use crate::fasthash::FastHasher;
 use crate::ipc_cache::MAX_PREFETCH_BYTES;
 use crate::reg_util::{pwstr_to_string, wide_null};
@@ -54,7 +56,8 @@ const MAX_PREFETCH_ITEMS: usize = 16;
 const DRIVE_REMOTE_TYPE: u32 = 4;
 
 const FIRST_ID: u32 = 1;
-const LAST_ID: u32 = 0x7FFF;
+const LAST_ID: u32 = 0x7F00;
+pub const CUSTOMIZE_MENU_CMD_ID: u32 = 0x7F01;
 const CMIC_MASK_UNICODE: u32 = SEE_MASK_UNICODE;
 const CMIC_MASK_ASYNCOK: u32 = SEE_MASK_ASYNCOK;
 const CMIC_MASK_SHIFT_DOWN: u32 = 0x1000_0000;
@@ -571,6 +574,8 @@ pub struct NativeMenu {
     menu2: Option<IContextMenu2>,
     menu3: Option<IContextMenu3>,
     hmenu: OwnedMenu,
+    detached_submenus: Vec<OwnedMenu>,
+    customized: bool,
     first_id: u32,
     end_id: u32,
     cmf: u32,
@@ -647,6 +652,8 @@ impl NativeMenu {
             menu2,
             menu3,
             hmenu,
+            detached_submenus: Vec::new(),
+            customized: false,
             first_id: FIRST_ID,
             end_id,
             cmf,
@@ -654,6 +661,23 @@ impl NativeMenu {
             build_us,
             _sta: PhantomData,
         })
+    }
+
+    pub fn apply_customizations(&mut self, config: &RwmConfig) {
+        if self.customized {
+            return;
+        }
+        let hmenu = self.hmenu.0;
+        let first_id = self.first_id;
+        let end_id = self.end_id;
+        let menu_ref = &self.menu;
+        apply_to_hmenu(hmenu, &mut self.detached_submenus, config, |cmd_id| {
+            if !(first_id..end_id).contains(&cmd_id) {
+                return None;
+            }
+            canonical_verb_from_iface(menu_ref, (cmd_id - first_id) as usize)
+        });
+        self.customized = true;
     }
 
     pub fn selection(&self) -> &SelectionKey {
@@ -872,43 +896,46 @@ impl NativeMenu {
 
     fn canonical_verb(&self, id: u32) -> Option<String> {
         let offset = self.command_offset(id)?;
-        let mut buffer = [0u16; 512];
-        let result = unsafe {
-            self.menu.GetCommandString(
-                offset,
-                GCS_VERBW,
-                None,
-                PSTR(buffer.as_mut_ptr().cast()),
-                buffer.len() as u32,
-            )
-        };
-        if result.is_ok() {
-            let len = nul_len(&buffer);
-            if len != 0 && len < buffer.len() {
-                if let Ok(text) = String::from_utf16(&buffer[..len]) {
-                    return Some(text);
-                }
+        canonical_verb_from_iface(&self.menu, offset)
+    }
+}
+
+fn canonical_verb_from_iface(menu: &IContextMenu, offset: usize) -> Option<String> {
+    let mut buffer = [0u16; 512];
+    let result = unsafe {
+        menu.GetCommandString(
+            offset,
+            GCS_VERBW,
+            None,
+            PSTR(buffer.as_mut_ptr().cast()),
+            buffer.len() as u32,
+        )
+    };
+    if result.is_ok() {
+        let len = nul_len(&buffer);
+        if len != 0 && len < buffer.len() {
+            if let Ok(text) = String::from_utf16(&buffer[..len]) {
+                return Some(text);
             }
         }
-        let mut buffer = [0u8; 512];
-        unsafe {
-            self.menu
-                .GetCommandString(
-                    offset,
-                    GCS_VERBA,
-                    None,
-                    PSTR(buffer.as_mut_ptr()),
-                    buffer.len() as u32,
-                )
-                .ok()?;
-        }
-        let len = buffer.iter().position(|&byte| byte == 0)?;
-        let mut wide = [0u16; 512];
-        let len = unsafe {
-            MultiByteToWideChar(CP_ACP, Default::default(), &buffer[..len], Some(&mut wide))
-        };
-        (len > 0).then(|| String::from_utf16_lossy(&wide[..len as usize]))
     }
+    let mut buffer = [0u8; 512];
+    unsafe {
+        menu.GetCommandString(
+            offset,
+            GCS_VERBA,
+            None,
+            PSTR(buffer.as_mut_ptr()),
+            buffer.len() as u32,
+        )
+        .ok()?;
+    }
+    let len = buffer.iter().position(|&byte| byte == 0)?;
+    let mut wide = [0u16; 512];
+    let len = unsafe {
+        MultiByteToWideChar(CP_ACP, Default::default(), &buffer[..len], Some(&mut wide))
+    };
+    (len > 0).then(|| String::from_utf16_lossy(&wide[..len as usize]))
 }
 
 fn to_ansi(wide: &[u16]) -> Option<Vec<u8>> {
@@ -1071,6 +1098,153 @@ pub fn enable_dark_mode_menus() -> bool {
 pub fn is_japanese_ui() -> bool {
     const LANG_JAPANESE: u16 = 0x11;
     unsafe { GetUserDefaultUILanguage() & 0x03ff == LANG_JAPANESE }
+}
+
+pub fn customize_menu_label() -> &'static str {
+    if is_japanese_ui() {
+        "メニューをカスタマイズ (RWM)..."
+    } else {
+        "Customize Menu (RWM)..."
+    }
+}
+
+pub fn menu_item_filter_key(canonical_verb: Option<&str>, clean_label: &str) -> Option<String> {
+    if let Some(verb) = canonical_verb.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(format!("verb:{verb}"))
+    } else {
+        let label = clean_label.trim();
+        (!label.is_empty()).then(|| format!("label:{label}"))
+    }
+}
+
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+pub fn item_matches_hidden(
+    hidden_items: &[String],
+    canonical_verb: Option<&str>,
+    clean_label: &str,
+) -> bool {
+    let verb = canonical_verb.map(str::trim).filter(|s| !s.is_empty());
+    let label = clean_label.trim();
+    hidden_items.iter().any(|rule| {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            return false;
+        }
+        if let Some(target_verb) = rule
+            .strip_prefix("verb:")
+            .or_else(|| rule.strip_prefix("VERB:"))
+        {
+            verb.is_some_and(|v| eq_ignore_case(v, target_verb.trim()))
+        } else if let Some(target_label) = rule
+            .strip_prefix("label:")
+            .or_else(|| rule.strip_prefix("LABEL:"))
+        {
+            !label.is_empty() && eq_ignore_case(label, target_label.trim())
+        } else {
+            verb.is_some_and(|v| eq_ignore_case(v, rule))
+                || (!label.is_empty() && eq_ignore_case(label, rule))
+        }
+    })
+}
+
+fn orphan_separator_positions(is_separator: &[bool]) -> Vec<u32> {
+    let mut remove = Vec::new();
+    let Some(first_non_sep) = is_separator.iter().position(|&sep| !sep) else {
+        // Every entry is a separator.
+        for i in 0..is_separator.len() {
+            remove.push(i as u32);
+        }
+        return remove;
+    };
+    let last_non_sep = is_separator
+        .iter()
+        .rposition(|&sep| !sep)
+        .unwrap_or(first_non_sep);
+    let mut prev_was_sep = false;
+    for (idx, &is_sep) in is_separator.iter().enumerate() {
+        if !is_sep {
+            prev_was_sep = false;
+            continue;
+        }
+        if idx < first_non_sep || idx > last_non_sep || prev_was_sep {
+            remove.push(idx as u32);
+        } else {
+            prev_was_sep = true;
+        }
+    }
+    remove
+}
+
+fn apply_to_hmenu(
+    hmenu: HMENU,
+    detached_submenus: &mut Vec<OwnedMenu>,
+    config: &RwmConfig,
+    resolve_verb: impl Fn(u32) -> Option<String>,
+) {
+    if !config.hidden_items.is_empty() {
+        let has_verb_rules = config
+            .hidden_items
+            .iter()
+            .any(|rule| !rule.to_ascii_lowercase().starts_with("label:"));
+        let count = menu_item_count(hmenu);
+        for index in (0..count).rev() {
+            let Some((info, label)) = menu_info(hmenu, index) else {
+                continue;
+            };
+            if info.fType.contains(MFT_SEPARATOR) {
+                continue;
+            }
+            let clean = clean_label(&label);
+            let mut matched = item_matches_hidden(&config.hidden_items, None, &clean);
+            if !matched && has_verb_rules && info.hSubMenu.is_invalid() {
+                if let Some(verb) = resolve_verb(info.wID) {
+                    matched = item_matches_hidden(&config.hidden_items, Some(&verb), &clean);
+                }
+            }
+            if matched {
+                if !info.hSubMenu.is_invalid() {
+                    if unsafe { RemoveMenu(hmenu, index, MF_BYPOSITION) }.is_ok() {
+                        detached_submenus.push(OwnedMenu(info.hSubMenu));
+                    }
+                } else {
+                    let _ = unsafe { DeleteMenu(hmenu, index, MF_BYPOSITION) };
+                }
+            }
+        }
+
+        let after_count = menu_item_count(hmenu);
+        let mut is_sep = Vec::with_capacity(after_count as usize);
+        for index in 0..after_count {
+            let sep = menu_info(hmenu, index)
+                .is_some_and(|(info, _)| info.fType.contains(MFT_SEPARATOR));
+            is_sep.push(sep);
+        }
+        for pos in orphan_separator_positions(&is_sep).into_iter().rev() {
+            let _ = unsafe { DeleteMenu(hmenu, pos, MF_BYPOSITION) };
+        }
+    }
+
+    if config.show_customize_entry {
+        if menu_item_count(hmenu) > 0 {
+            let _ = unsafe { AppendMenuW(hmenu, WMF_SEPARATOR, 0, PCWSTR::null()) };
+        }
+        let label = wide_null(customize_menu_label());
+        let _ = unsafe {
+            AppendMenuW(
+                hmenu,
+                MF_STRING,
+                CUSTOMIZE_MENU_CMD_ID as usize,
+                PCWSTR(label.as_ptr()),
+            )
+        };
+    }
 }
 
 /// Current Windows clipboard change counter, used to invalidate Paste cache entries automatically.
@@ -1293,5 +1467,82 @@ mod tests {
         assert!(virtual_menu.root_item_count() > 0);
         assert!(virtual_menu.selection().folder_fs_path().is_none());
         assert!(!virtual_menu.selection().matches(background.selection()));
+    }
+
+    #[test]
+    fn orphan_separator_positions_removes_leading_trailing_and_consecutive() {
+        assert_eq!(orphan_separator_positions(&[true, false, true, true, false, true]), vec![0, 3, 5]);
+        assert_eq!(orphan_separator_positions(&[true, true]), vec![0, 1]);
+        assert_eq!(orphan_separator_positions(&[false, true, false]), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn menu_item_filter_matching_handles_verbs_labels_and_bare_rules() {
+        assert_eq!(
+            menu_item_filter_key(Some("pintohomefile"), "お気に入りに追加"),
+            Some("verb:pintohomefile".to_string())
+        );
+        assert_eq!(
+            menu_item_filter_key(None, "7-Zip"),
+            Some("label:7-Zip".to_string())
+        );
+        let rules = vec![
+            "verb:PinToHomeFile".to_string(),
+            "label:メモ帳で編集".to_string(),
+            "Send with Tailscale...".to_string(),
+        ];
+        assert!(item_matches_hidden(&rules, Some("pintohomefile"), "Pin to Favorites"));
+        assert!(item_matches_hidden(&rules, None, "メモ帳で編集"));
+        assert!(item_matches_hidden(&rules, Some("tailscale"), "Send with Tailscale..."));
+        assert!(!item_matches_hidden(&rules, Some("open"), "開く"));
+    }
+
+    #[test]
+    fn hmenu_pruning_and_customize_append_work_on_real_popup_menu() {
+        let menu = OwnedMenu::create_popup().unwrap();
+        let append_str = |id: u32, text: &str| {
+            let w = wide_null(text);
+            unsafe { AppendMenuW(menu.as_handle(), MF_STRING, id as usize, PCWSTR(w.as_ptr())).unwrap() };
+        };
+        let append_sep = || {
+            unsafe { AppendMenuW(menu.as_handle(), WMF_SEPARATOR, 0, PCWSTR::null()).unwrap() };
+        };
+        append_str(10, "&Open");
+        append_sep();
+        append_str(11, "HideByVerb");
+        append_sep();
+        append_str(12, "HideByLabel");
+        append_sep();
+        append_str(13, "&Properties");
+
+        let cfg = RwmConfig {
+            hidden_items: vec!["verb:testverb".into(), "label:HideByLabel".into()],
+            show_customize_entry: true,
+            ..RwmConfig::default()
+        };
+        let mut detached = Vec::new();
+        apply_to_hmenu(menu.as_handle(), &mut detached, &cfg, |id| {
+            (id == 11).then(|| "TestVerb".to_string())
+        });
+
+        let mut remaining = Vec::new();
+        for i in 0..menu_item_count(menu.as_handle()) {
+            let (info, text) = menu_info(menu.as_handle(), i).unwrap();
+            if info.fType.contains(MFT_SEPARATOR) {
+                remaining.push("---".to_string());
+            } else {
+                remaining.push(format!("{}:{text}", info.wID));
+            }
+        }
+        assert_eq!(
+            remaining,
+            vec![
+                "10:&Open".to_string(),
+                "---".to_string(),
+                "13:&Properties".to_string(),
+                "---".to_string(),
+                format!("{CUSTOMIZE_MENU_CMD_ID}:{}", customize_menu_label()),
+            ]
+        );
     }
 }

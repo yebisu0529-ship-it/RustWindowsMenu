@@ -1,4 +1,4 @@
-# RustWindowsMenu v0.3.0 configuration
+# RustWindowsMenu v0.4.0 configuration
 # Copy to %APPDATA%\RustWindowsMenu\config.toml or run `rwm config init`.
 # Emergency kill switch: create an empty file at %LOCALAPPDATA%\RustWindowsMenu\DISABLE_HOOK.
 
@@ -43,3 +43,10 @@ host_cache_entries = 6
 
 # Cache entry lifetime in milliseconds before invalidation (1000-30000).
 host_cache_ttl_ms = 8000
+
+# Append "Customize Menu (RWM)..." / "メニューをカスタマイズ (RWM)..." at the bottom of right-click menus.
+show_customize_entry = true
+
+# Menu items hidden from right-click menus (e.g. "verb:pintohomefile" or "label:共有").
+# Managed visually via right-click -> Customize Menu (RWM)... or `rwm ui`.
+hidden_items = []

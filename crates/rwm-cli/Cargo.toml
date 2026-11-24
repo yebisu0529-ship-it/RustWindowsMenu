@@ -30,6 +30,8 @@ tracing-subscriber.workspace = true
 workspace = true
 features = [
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Com",
@@ -47,5 +49,7 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
 ]

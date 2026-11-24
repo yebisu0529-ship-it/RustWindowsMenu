@@ -53,6 +53,7 @@ fn help_lists_complete_v03_surface_and_hides_probe_worker() {
         "inspect",
         "optimize",
         "preview",
+        "ui",
         "handlers",
         "classic",
         "config",

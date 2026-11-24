@@ -101,9 +101,23 @@ fn arguments(request: &ProbeRequest) -> Vec<OsString> {
     args
 }
 
-pub fn run(request: &ProbeRequest, timeout: Duration, phase: &str) -> CliResult<Value> {
+pub fn resolve_cli_exe() -> CliResult<std::path::PathBuf> {
     let exe =
         std::env::current_exe().context(|| "cannot locate probe worker executable".to_string())?;
+    if exe
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("rwm-host.exe"))
+    {
+        let sibling = exe.with_file_name("rwm.exe");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    Ok(exe)
+}
+
+pub fn run(request: &ProbeRequest, timeout: Duration, phase: &str) -> CliResult<Value> {
+    let exe = resolve_cli_exe()?;
     let target = match request {
         ProbeRequest::Inspect(args) => args.target.path.clone(),
         ProbeRequest::Bench(args) => args.target.path.clone(),

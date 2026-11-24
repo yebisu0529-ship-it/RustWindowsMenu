@@ -16,6 +16,7 @@ use rwm_core::ipc_cache::{
 };
 use rwm_core::shell::{
     clipboard_sequence_number, enable_dark_mode_menus, NativeMenu, OleGuard, SelectionKey,
+    CUSTOMIZE_MENU_CMD_ID,
 };
 use rwm_core::warm_pool::WarmDllPin;
 use windows::core::w;
@@ -34,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const WM_APP_PROCESS_WORK: u32 = WM_APP + 1;
+const WM_APP_CONFIG_RELOAD: u32 = WM_APP + 2;
 const CACHE_PRUNE_TIMER: usize = 0x5257_4D50;
 const POPUP_CLASS_NAME: &str = "RustWindowsMenuPopup_v3";
 const MAX_PENDING_SHOW_AGE: Duration = Duration::from_millis(2000);
@@ -90,6 +92,10 @@ impl<M> CacheCore<M> {
         while self.entries.len() > self.max_entries {
             self.entries.pop_front();
         }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 
     fn prune_expired(&mut self, now: Instant) -> usize {
@@ -359,6 +365,20 @@ impl MenuCacheWorker {
         }
     }
 
+    pub fn on_config_reload_signal(&self) {
+        let raw = self.popup_hwnd.load(Ordering::Acquire);
+        if raw != 0 {
+            let _ = unsafe {
+                PostMessageW(
+                    HWND(raw as *mut c_void),
+                    WM_APP_CONFIG_RELOAD,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        }
+    }
+
     pub fn shutdown(mut self) {
         self.stop_inner();
     }
@@ -518,15 +538,29 @@ fn sta_thread_main(
         if stop_requested.load(Ordering::Acquire) {
             break;
         }
-        if cfg_checked_at.elapsed() >= Duration::from_secs(1) {
-            cfg_checked_at = Instant::now();
+        let mut config_changed = false;
+        if msg.message == WM_APP_CONFIG_RELOAD {
             if let Ok(latest) = RwmConfig::load_or_default() {
                 cfg = latest;
-                cache.reconfigure(
-                    cfg.host_cache_entries,
-                    Duration::from_millis(u64::from(cfg.host_cache_ttl_ms)),
-                );
             }
+            cfg_checked_at = Instant::now();
+            config_changed = true;
+        } else if cfg_checked_at.elapsed() >= Duration::from_secs(1) {
+            cfg_checked_at = Instant::now();
+            if let Ok(latest) = RwmConfig::load_or_default() {
+                if latest != cfg {
+                    cfg = latest;
+                    config_changed = true;
+                }
+            }
+        }
+        if config_changed {
+            cache.reconfigure(
+                cfg.host_cache_entries,
+                Duration::from_millis(u64::from(cfg.host_cache_ttl_ms)),
+            );
+            cache.clear();
+            sync_cache_views(&shared_host, &coordinator, &cache, None);
         }
         if msg.message == WM_TIMER && msg.wParam.0 == CACHE_PRUNE_TIMER {
             if cache.prune_expired(Instant::now()) > 0 {
@@ -668,7 +702,10 @@ fn process_work(
 
         let before = (cfg.pin_handler_dlls && warm_pin.should_snapshot())
             .then(WarmDllPin::snapshot_loaded_modules);
-        let built = NativeMenu::build_from_selection(popup_hwnd, selection);
+        let built = NativeMenu::build_from_selection(popup_hwnd, selection).map(|mut menu| {
+            menu.apply_customizations(cfg);
+            menu
+        });
         if let Some(before) = before {
             warm_pin.pin_newly_loaded(&before);
         }
@@ -756,6 +793,10 @@ fn show_and_invoke(
     let defview = HWND(req.defview_hwnd as *mut c_void);
 
     match selected {
+        Ok(Some(cmd_id)) if cmd_id == CUSTOMIZE_MENU_CMD_ID => {
+            restore_foreground(popup_hwnd, root);
+            crate::gui::spawn_manager_for_selection(menu.selection());
+        }
         Ok(Some(cmd_id)) => {
             if menu
                 .canonical_verb_for_id(cmd_id)

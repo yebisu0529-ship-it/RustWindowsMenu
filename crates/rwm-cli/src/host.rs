@@ -7,11 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rwm_core::ipc_cache::{claim_show_msg_id, prefetch_msg_id, SharedCacheHost};
+use rwm_core::config::RwmConfig;
+use rwm_core::ipc_cache::{
+    claim_show_msg_id, config_reload_msg_id, prefetch_msg_id, SharedCacheHost,
+};
+use rwm_core::shell::{enable_dark_mode_menus, is_japanese_ui};
 use windows::core::{w, Interface, BSTR, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
-    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Com::{
@@ -30,16 +34,22 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{
-    CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView, IShellWindows,
-    SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
+    Shell_NotifyIconW, CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual,
+    IShellView, IShellWindows, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
-    GetShellWindow, GetWindowThreadProcessId, KillTimer, MsgWaitForMultipleObjects, PeekMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_CREATE, GWLP_USERDATA,
-    HHOOK, MSG, PM_REMOVE, QS_ALLINPUT, SW_HIDE, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_DESTROY, WM_QUIT, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos, GetShellWindow,
+    GetWindowThreadProcessId, KillTimer, LoadIconW, MsgWaitForMultipleObjects, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, TrackPopupMenuEx,
+    TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_CREATE, GWLP_USERDATA, HHOOK, HICON,
+    IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PM_REMOVE, QS_ALLINPUT,
+    SW_HIDE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::error::{CliError, CliResult, Context};
@@ -55,6 +65,11 @@ pub const HOST_READY_EVENT_NAME: &str = r"Local\RustWindowsMenu_HookHost_v2.Read
 const DEBOUNCE_TIMER: usize = 1;
 const SWEEP_TIMER: usize = 2;
 const HOST_WINDOW_CLASS: &str = "RustWindowsMenuHost_v2";
+const WM_APP_TRAY: u32 = WM_APP + 10;
+const TRAY_ICON_ID: u32 = 1;
+const TRAY_CMD_OPEN_UI: usize = 1;
+const TRAY_CMD_TOGGLE_ENABLED: usize = 2;
+const TRAY_CMD_EXIT: usize = 3;
 
 static HOST_HWND: AtomicIsize = AtomicIsize::new(0);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -486,12 +501,79 @@ impl Drop for HookSession<'_> {
     }
 }
 
+struct TrayIconGuard {
+    hwnd: HWND,
+    icon: HICON,
+    owns_icon: bool,
+}
+
+impl TrayIconGuard {
+    fn create(hwnd: HWND) -> Self {
+        let (icon, owns_icon) = match crate::gui::create_brand_icon(16) {
+            Some(icon) => (icon, true),
+            None => (
+                unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+                false,
+            ),
+        };
+        let guard = Self {
+            hwnd,
+            icon,
+            owns_icon,
+        };
+        guard.add();
+        guard
+    }
+
+    fn nid(&self) -> NOTIFYICONDATAW {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ICON_ID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_APP_TRAY,
+            hIcon: self.icon,
+            ..Default::default()
+        };
+        let tip = wide("RustWindowsMenu");
+        let n = tip.len().min(nid.szTip.len());
+        nid.szTip[..n].copy_from_slice(&tip[..n]);
+        nid
+    }
+
+    fn add(&self) {
+        let nid = self.nid();
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+    }
+}
+
+impl Drop for TrayIconGuard {
+    fn drop(&mut self) {
+        let nid = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ICON_ID,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            if self.owns_icon && !self.icon.is_invalid() {
+                let _ = DestroyIcon(self.icon);
+            }
+        }
+    }
+}
+
 struct WindowState<'a> {
     session: HookSession<'a>,
     taskbar_created: u32,
     menu_cache: Option<&'a MenuCacheWorker>,
     prefetch_msg: u32,
     claim_show_msg: u32,
+    config_reload_msg: u32,
+    tray_icon: Option<&'a TrayIconGuard>,
 }
 impl WindowState<'_> {
     fn rescan(&mut self) {
@@ -499,6 +581,86 @@ impl WindowState<'_> {
         for failure in report.failed {
             tracing::warn!(thread_id = failure.thread_id, reason = %failure.reason, "Explorer attach failed");
         }
+    }
+}
+
+fn show_tray_menu(hwnd: HWND, state: &WindowState<'_>) {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    let ja = is_japanese_ui();
+    let cfg = RwmConfig::load_or_default().unwrap_or_default();
+    let open_label = wide(if ja {
+        "メニュー管理画面を開く..."
+    } else {
+        "Open Menu Manager..."
+    });
+    let toggle_label = wide(if ja {
+        "右クリック拡張を有効化"
+    } else {
+        "Enable Context Menu Acceleration"
+    });
+    let exit_label = wide(if ja {
+        "RWM ホストを終了"
+    } else {
+        "Exit RWM Host"
+    });
+    let toggle_flags = MF_STRING | if cfg.enabled { MF_CHECKED } else { MF_UNCHECKED };
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            TRAY_CMD_OPEN_UI,
+            PCWSTR(open_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            toggle_flags,
+            TRAY_CMD_TOGGLE_ENABLED,
+            PCWSTR(toggle_label.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, PCWSTR(exit_label.as_ptr()));
+        let _ = SetMenuDefaultItem(menu, TRAY_CMD_OPEN_UI as u32, 0);
+    }
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    let cmd = unsafe {
+        TrackPopupMenuEx(
+            menu,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+            pt.x,
+            pt.y,
+            hwnd,
+            None,
+        )
+    }
+    .0 as usize;
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
+    match cmd {
+        TRAY_CMD_OPEN_UI => {
+            let _ = crate::gui::spawn_manager(None, false);
+        }
+        TRAY_CMD_TOGGLE_ENABLED => {
+            let mut next = RwmConfig::load_or_default().unwrap_or_default();
+            next.enabled = !next.enabled;
+            if next.save().is_ok() {
+                if let Some(worker) = state.menu_cache {
+                    worker.on_config_reload_signal();
+                }
+            }
+        }
+        TRAY_CMD_EXIT => {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            unsafe { PostQuitMessage(0) };
+        }
+        _ => {}
     }
 }
 
@@ -554,9 +716,29 @@ unsafe extern "system" fn window_proc(
                     .is_some_and(MenuCacheWorker::on_claim_show_signal);
                 return Some(LRESULT(isize::from(claimed)));
             }
-            if message == (*state).taskbar_created
-                || (message == WM_TIMER && matches!(wparam.0, DEBOUNCE_TIMER | SWEEP_TIMER))
-            {
+            if message == (*state).config_reload_msg {
+                if let Some(worker) = (*state).menu_cache {
+                    worker.on_config_reload_signal();
+                }
+                return Some(LRESULT(1));
+            }
+            if message == WM_APP_TRAY {
+                let event = (lparam.0 as u32) & 0xffff;
+                if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
+                    let _ = crate::gui::spawn_manager(None, false);
+                } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+                    show_tray_menu(hwnd, &*state);
+                }
+                return Some(LRESULT(0));
+            }
+            if message == (*state).taskbar_created {
+                if let Some(tray) = (*state).tray_icon {
+                    tray.add();
+                }
+                (*state).rescan();
+                return Some(LRESULT(0));
+            }
+            if message == WM_TIMER && matches!(wparam.0, DEBOUNCE_TIMER | SWEEP_TIMER) {
                 if message == WM_TIMER {
                     let _ = KillTimer(hwnd, wparam.0);
                 }
@@ -710,6 +892,7 @@ pub fn run() -> CliResult<ExitCode> {
         return Err(CliError::new("SetWinEventHook failed"));
     }
     let _event_guard = WinEventGuard(event_hook);
+    let _dark = enable_dark_mode_menus();
     let shared_cache = SharedCacheHost::create()
         .map(Arc::new)
         .map_err(|error| tracing::warn!("shared menu cache unavailable: {error}"))
@@ -719,12 +902,15 @@ pub fn run() -> CliResult<ExitCode> {
             .map_err(|error| tracing::warn!("menu STA worker unavailable: {error}"))
             .ok()
     });
+    let tray_icon = TrayIconGuard::create(hwnd.0);
     let mut state = WindowState {
         session: HookSession::new(&library),
         taskbar_created,
         menu_cache: menu_cache.as_ref(),
         prefetch_msg: prefetch_msg_id(),
         claim_show_msg: claim_show_msg_id(),
+        config_reload_msg: config_reload_msg_id(),
+        tray_icon: Some(&tray_icon),
     };
     unsafe {
         SetWindowLongPtrW(
@@ -771,8 +957,9 @@ pub fn run() -> CliResult<ExitCode> {
     }
     let detached = state.session.detach();
     drop(_event_guard);
-    drop(hwnd);
     drop(state);
+    drop(tray_icon);
+    drop(hwnd);
     if let Some(worker) = menu_cache.take() {
         worker.shutdown();
     }

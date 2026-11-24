@@ -61,7 +61,7 @@ pub fn run(action: ConfigAction) -> CliResult<ExitCode> {
         ConfigAction::Reset => {
             RwmConfig::default().save()?;
             print_line(format!(
-                "Reset config to v0.3 defaults: {}",
+                "Reset config to v0.4 defaults: {}",
                 config_path().display()
             ));
         }

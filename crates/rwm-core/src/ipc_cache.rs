@@ -5,13 +5,13 @@ use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WPARAM};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, RegisterWindowMessageW};
 use windows_core::PCWSTR;
 
 use crate::build_info::ABI_VERSION;
@@ -26,6 +26,7 @@ const STALE_LOCK_MS: u64 = 250;
 static PREFETCH_MSG: AtomicU32 = AtomicU32::new(0);
 static CLAIM_SHOW_MSG: AtomicU32 = AtomicU32::new(0);
 static EDIT_LABEL_MSG: AtomicU32 = AtomicU32::new(0);
+static CONFIG_RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Monotonic tick count in milliseconds matching Windows `GetTickCount64`.
 #[inline]
@@ -56,6 +57,31 @@ pub fn claim_show_msg_id() -> u32 {
 /// Window message posted from `rwm-host.exe` back to `SHELLDLL_DefView` to start inline rename.
 pub fn edit_label_msg_id() -> u32 {
     registered_message(&EDIT_LABEL_MSG, "RustWindowsMenu.EditLabel.v3")
+}
+
+/// Window message posted to `rwm-host.exe` when `config.toml` or blocked handlers change.
+pub fn config_reload_msg_id() -> u32 {
+    registered_message(&CONFIG_RELOAD_MSG, "RustWindowsMenu.ConfigReload.v3")
+}
+
+/// Signals a running `rwm-host.exe` to reload configuration and drop stale cached menus immediately.
+pub fn notify_host_config_reload() -> bool {
+    let Some(client) = SharedCacheClient::open() else {
+        return false;
+    };
+    let host_hwnd = client.host_hwnd();
+    if host_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        PostMessageW(
+            HWND(host_hwnd as *mut c_void),
+            config_reload_msg_id(),
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .is_ok()
+    }
 }
 
 #[repr(C)]

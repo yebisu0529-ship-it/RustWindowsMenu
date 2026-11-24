@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "rwm",
     version,
-    about = "RustWindowsMenu 0.3: ultra-fast native Windows menus",
+    about = "RustWindowsMenu 0.4: ultra-fast native Windows menus",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -29,6 +29,7 @@ pub enum Command {
     Inspect(InspectArgs),
     Optimize(OptimizeArgs),
     Preview(PreviewArgs),
+    Ui(UiArgs),
     Handlers {
         #[command(subcommand)]
         action: HandlersAction,
@@ -127,6 +128,16 @@ pub struct PreviewArgs {
     pub extended: bool,
     #[arg(long)]
     pub no_animation: bool,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UiArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[arg(long)]
+    pub wait: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -224,7 +235,8 @@ mod tests {
             vec!["rwm", "inspect", "--extended", "--json"],
             vec!["rwm", "optimize", "--threshold-ms", "25", "--json"],
             vec!["rwm", "optimize", "--apply"],
-            vec!["rwm", "preview", "--extended", "--no-animation"],
+            vec!["rwm", "preview", "--extended", "--no-animation", "--raw"],
+            vec!["rwm", "ui", "--background", "--wait"],
             vec!["rwm", "handlers", "list", "--json"],
             vec![
                 "rwm",
