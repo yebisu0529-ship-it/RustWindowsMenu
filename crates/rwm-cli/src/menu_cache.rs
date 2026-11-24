@@ -20,23 +20,32 @@ use rwm_core::shell::{
 };
 use rwm_core::warm_pool::WarmDllPin;
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleFlushClipboard;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostMessageW, RegisterClassExW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, GWLP_USERDATA,
-    HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOSIZE, WM_APP, WM_CANCELMODE, WM_NULL, WM_QUIT,
-    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, EndMenu, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+    WindowFromPoint, GA_ROOT, GWLP_USERDATA, HC_ACTION, HHOOK, HWND_TOP, KBDLLHOOKSTRUCT,
+    LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WA_INACTIVE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CANCELMODE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const WM_APP_PROCESS_WORK: u32 = WM_APP + 1;
 const WM_APP_CONFIG_RELOAD: u32 = WM_APP + 2;
+const WM_APP_CANCEL_MENU: u32 = WM_APP + 3;
 const CACHE_PRUNE_TIMER: usize = 0x5257_4D50;
+const TRACK_WATCHDOG_TIMER: usize = 0x5257_4D51;
 const POPUP_CLASS_NAME: &str = "RustWindowsMenuPopup_v3";
 const MAX_PENDING_SHOW_AGE: Duration = Duration::from_millis(2000);
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(2000);
@@ -158,8 +167,12 @@ impl<M> CacheCore<M> {
     }
 }
 
+static TRACK_HOOK_POPUP: AtomicIsize = AtomicIsize::new(0);
+static TRACK_HOOK_OUTSIDE_CLICK: AtomicBool = AtomicBool::new(false);
+
 struct PopupWindowState {
     menu: *const NativeMenu,
+    had_fg: bool,
 }
 
 struct PopupWindowGuard(HWND);
@@ -174,21 +187,168 @@ impl Drop for PopupWindowGuard {
 
 struct MenuBindingGuard<'a>(&'a mut PopupWindowState, PhantomData<&'a NativeMenu>);
 impl<'a> MenuBindingGuard<'a> {
-    fn bind(state: &'a mut PopupWindowState, menu: &'a NativeMenu) -> Self {
+    fn bind(state: &'a mut PopupWindowState, menu: &'a NativeMenu, had_fg: bool) -> Self {
         state.menu = std::ptr::from_ref(menu);
+        state.had_fg = had_fg;
         Self(state, PhantomData)
     }
 }
 impl Drop for MenuBindingGuard<'_> {
     fn drop(&mut self) {
         self.0.menu = std::ptr::null();
+        self.0.had_fg = false;
     }
 }
 
-struct TrackingGuard<'a>(&'a AtomicBool);
+fn is_win32_menu_window(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let mut buf = [0u16; 16];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len != 6 {
+        return false;
+    }
+    const MENU_CLASS: [u16; 6] = [
+        b'#' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'7' as u16,
+        b'6' as u16,
+        b'8' as u16,
+    ];
+    buf[..6] == MENU_CLASS
+}
+
+fn is_point_on_menu_or_owner(pt: POINT, popup_hwnd: HWND) -> bool {
+    let hit = unsafe { WindowFromPoint(pt) };
+    if hit.is_invalid() {
+        return false;
+    }
+    if hit == popup_hwnd || is_win32_menu_window(hit) {
+        return true;
+    }
+    let root = unsafe { GetAncestor(hit, GA_ROOT) };
+    !root.is_invalid() && (root == popup_hwnd || is_win32_menu_window(root))
+}
+
+unsafe extern "system" fn track_mouse_ll_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if code == HC_ACTION as i32
+            && matches!(
+                wparam.0 as u32,
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+            )
+        {
+            let raw = TRACK_HOOK_POPUP.load(Ordering::Acquire);
+            if raw != 0 && lparam.0 != 0 {
+                let popup = HWND(raw as *mut c_void);
+                let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                if !is_point_on_menu_or_owner(info.pt, popup) {
+                    TRACK_HOOK_OUTSIDE_CLICK.store(true, Ordering::Release);
+                    let _ = PostMessageW(popup, WM_APP_CANCEL_MENU, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }));
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+unsafe extern "system" fn track_key_ll_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if code == HC_ACTION as i32
+            && matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN)
+        {
+            let raw = TRACK_HOOK_POPUP.load(Ordering::Acquire);
+            if raw != 0 && lparam.0 != 0 {
+                let popup = HWND(raw as *mut c_void);
+                let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                if info.vkCode == u32::from(VK_ESCAPE.0) && GetForegroundWindow() != popup {
+                    let _ = PostMessageW(popup, WM_APP_CANCEL_MENU, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }));
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+struct TrackDismissHookGuard {
+    mouse_hook: Option<HHOOK>,
+    key_hook: Option<HHOOK>,
+}
+
+impl TrackDismissHookGuard {
+    fn install(popup_hwnd: HWND) -> Self {
+        TRACK_HOOK_OUTSIDE_CLICK.store(false, Ordering::Release);
+        TRACK_HOOK_POPUP.store(popup_hwnd.0 as isize, Ordering::Release);
+        let hmod = unsafe { GetModuleHandleW(None) }
+            .ok()
+            .map(HINSTANCE::from)
+            .unwrap_or_default();
+        let mouse_hook =
+            unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(track_mouse_ll_proc), hmod, 0) }.ok();
+        let key_hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(track_key_ll_proc), hmod, 0) }.ok();
+        Self {
+            mouse_hook,
+            key_hook,
+        }
+    }
+
+    fn dismissed_by_outside_click(&self) -> bool {
+        TRACK_HOOK_OUTSIDE_CLICK.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for TrackDismissHookGuard {
+    fn drop(&mut self) {
+        TRACK_HOOK_POPUP.store(0, Ordering::Release);
+        if let Some(hook) = self.mouse_hook.take() {
+            let _ = unsafe { UnhookWindowsHookEx(hook) };
+        }
+        if let Some(hook) = self.key_hook.take() {
+            let _ = unsafe { UnhookWindowsHookEx(hook) };
+        }
+    }
+}
+
+struct TrackingGuard<'a>(&'a AtomicBool, &'a SharedCacheHost);
+impl<'a> TrackingGuard<'a> {
+    fn enter(is_tracking: &'a AtomicBool, shared_host: &'a SharedCacheHost) -> Self {
+        is_tracking.store(true, Ordering::Release);
+        shared_host.set_tracking(true);
+        Self(is_tracking, shared_host)
+    }
+}
 impl Drop for TrackingGuard<'_> {
     fn drop(&mut self) {
+        self.1.set_tracking(false);
         self.0.store(false, Ordering::Release);
+    }
+}
+
+struct WatchdogTimerGuard(HWND);
+impl WatchdogTimerGuard {
+    fn arm(hwnd: HWND) -> Self {
+        unsafe {
+            let _ = SetTimer(hwnd, TRACK_WATCHDOG_TIMER, 100, None);
+        }
+        Self(hwnd)
+    }
+}
+impl Drop for WatchdogTimerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = KillTimer(self.0, TRACK_WATCHDOG_TIMER);
+        }
     }
 }
 
@@ -314,6 +474,7 @@ impl MenuCacheWorker {
     /// Sub-millisecond handoff gate run on `host.rs`'s window loop when Explorer sends `ClaimShow`.
     pub fn on_claim_show_signal(&self) -> bool {
         if self.is_tracking.load(Ordering::Acquire) {
+            self.cancel_active_menu();
             return false;
         }
         let Some(req) = self.shared_host.read_show() else {
@@ -339,16 +500,38 @@ impl MenuCacheWorker {
                         req,
                         received_at: now,
                     });
+                    self.shared_host.set_pending_show(true);
                     true
                 } else {
                     false
                 }
             }
         };
+        if !accepted && self.is_tracking.load(Ordering::Acquire) {
+            self.cancel_active_menu();
+        }
         if accepted {
             self.wake_sta();
         }
         accepted
+    }
+
+    pub fn cancel_active_menu(&self) {
+        {
+            let mut state = self.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+            state.pending_show = None;
+        }
+        self.shared_host.set_pending_show(false);
+        if self.is_tracking.load(Ordering::Acquire) {
+            let raw = self.popup_hwnd.load(Ordering::Acquire);
+            if raw != 0 {
+                let hwnd = HWND(raw as *mut c_void);
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                    let _ = PostMessageW(hwnd, WM_APP_CANCEL_MENU, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
     }
 
     fn wake_sta(&self) {
@@ -416,9 +599,24 @@ unsafe extern "system" fn popup_window_proc(
     let handled = catch_unwind(AssertUnwindSafe(|| {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupWindowState;
         if !state.is_null() {
+            if message == WM_APP_CANCEL_MENU {
+                let _ = EndMenu();
+                return Some(LRESULT(0));
+            }
+            if message == WM_TIMER && wparam.0 == TRACK_WATCHDOG_TIMER {
+                if !(*state).menu.is_null() && (*state).had_fg && GetForegroundWindow() != hwnd {
+                    let _ = EndMenu();
+                }
+                return Some(LRESULT(0));
+            }
             let menu = (*state).menu;
             if !menu.is_null() {
-                if let Some(result) = (*menu).handle_menu_msg(message, wparam, lparam) {
+                if (message == WM_ACTIVATE && (wparam.0 & 0xFFFF) == WA_INACTIVE as usize)
+                    || (message == WM_ACTIVATEAPP && wparam.0 == 0)
+                    || message == WM_CANCELMODE
+                {
+                    let _ = EndMenu();
+                } else if let Some(result) = (*menu).handle_menu_msg(message, wparam, lparam) {
                     return Some(result);
                 }
             }
@@ -446,14 +644,14 @@ fn create_popup_window() -> Result<PopupWindowGuard, String> {
     }
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             windows::core::PCWSTR(class_wide.as_ptr()),
             w!("RustWindowsMenu Popup"),
             WS_POPUP,
             0,
             0,
-            0,
-            0,
+            1,
+            1,
             None,
             None,
             instance,
@@ -461,6 +659,9 @@ fn create_popup_window() -> Result<PopupWindowGuard, String> {
         )
     }
     .map_err(|e| format!("CreateWindowExW popup owner failed: {e}"))?;
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+    }
     Ok(PopupWindowGuard(hwnd))
 }
 
@@ -504,6 +705,7 @@ fn sta_thread_main(
     let popup_hwnd = popup_guard.0;
     let mut win_state = Box::new(PopupWindowState {
         menu: std::ptr::null(),
+        had_fg: false,
     });
     unsafe {
         SetWindowLongPtrW(
@@ -595,6 +797,8 @@ fn sta_thread_main(
         let _ = unsafe { KillTimer(popup_hwnd, CACHE_PRUNE_TIMER) };
     }
     popup_hwnd_out.store(0, Ordering::Release);
+    shared_host.set_pending_show(false);
+    shared_host.set_tracking(false);
     shared_host.set_in_flight(0);
     shared_host.publish_slots(&[]);
     drop(cache);
@@ -647,10 +851,17 @@ fn process_work(
             return;
         }
         // 1. Check if a pending show request matches an entry already sitting in our LRU cache.
-        let ready_hit = take_matching_show(coordinator, cache);
+        let ready_hit = take_matching_show(coordinator, cache, shared_host);
         if let Some((req, entry)) = ready_hit {
             sync_cache_views(shared_host, coordinator, cache, None);
-            show_and_invoke(popup_hwnd, win_state, &entry.menu, &req, is_tracking);
+            show_and_invoke(
+                popup_hwnd,
+                win_state,
+                &entry.menu,
+                &req,
+                is_tracking,
+                shared_host,
+            );
             drop(entry);
             continue;
         }
@@ -664,6 +875,7 @@ fn process_work(
             // Drop stale pending_show when there is no cache hit and no queued/in-flight prefetch.
             let mut state = coordinator.lock().unwrap_or_else(|e| e.into_inner());
             state.pending_show = None;
+            shared_host.set_pending_show(false);
             return;
         };
         if payload.request_seq <= *last_seq {
@@ -732,6 +944,7 @@ fn process_work(
                     .is_some_and(|p| p.req.key_hash == effective_hash)
                 {
                     state.pending_show = None;
+                    shared_host.set_pending_show(false);
                 }
             }
         }
@@ -741,6 +954,7 @@ fn process_work(
 fn take_matching_show(
     coordinator: &Mutex<CoordinatorState>,
     cache: &mut CacheCore<NativeMenu>,
+    shared_host: &SharedCacheHost,
 ) -> Option<(ShowRequest, CachedEntry<NativeMenu>)> {
     let now = Instant::now();
     let pending = {
@@ -748,6 +962,7 @@ fn take_matching_show(
         let pending = state.pending_show.as_ref()?;
         if now.saturating_duration_since(pending.received_at) > MAX_PENDING_SHOW_AGE {
             state.pending_show = None;
+            shared_host.set_pending_show(false);
             return None;
         }
         if cache.contains(pending.req.key_hash, pending.req.clipboard_seq, now) {
@@ -756,8 +971,56 @@ fn take_matching_show(
             None
         }
     }?;
-    let entry = cache.take(pending.req.key_hash, pending.req.clipboard_seq, now)?;
+    let Some(entry) = cache.take(pending.req.key_hash, pending.req.clipboard_seq, now) else {
+        shared_host.set_pending_show(false);
+        return None;
+    };
     Some((pending.req, entry))
+}
+
+fn activate_popup_owner(
+    popup_hwnd: HWND,
+    explorer_root: HWND,
+    anchor_x: i32,
+    anchor_y: i32,
+) -> bool {
+    unsafe {
+        let _ = SetWindowPos(
+            popup_hwnd,
+            HWND_TOP,
+            anchor_x,
+            anchor_y,
+            1,
+            1,
+            SWP_SHOWWINDOW,
+        );
+        let _ = ShowWindow(popup_hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(popup_hwnd);
+        if GetForegroundWindow() == popup_hwnd {
+            return true;
+        }
+        let _ = BringWindowToTop(popup_hwnd);
+        let _ = SetForegroundWindow(popup_hwnd);
+        if GetForegroundWindow() == popup_hwnd {
+            return true;
+        }
+        let fg = GetForegroundWindow();
+        let target = if !fg.is_invalid() { fg } else { explorer_root };
+        if !target.is_invalid() {
+            let fg_tid = GetWindowThreadProcessId(target, None);
+            let cur_tid = GetCurrentThreadId();
+            if fg_tid != 0
+                && fg_tid != cur_tid
+                && AttachThreadInput(cur_tid, fg_tid, true).as_bool()
+            {
+                let _ = BringWindowToTop(popup_hwnd);
+                let _ = SetForegroundWindow(popup_hwnd);
+                let _ = SetActiveWindow(popup_hwnd);
+                let _ = AttachThreadInput(cur_tid, fg_tid, false);
+            }
+        }
+        GetForegroundWindow() == popup_hwnd
+    }
 }
 
 fn show_and_invoke(
@@ -766,35 +1029,34 @@ fn show_and_invoke(
     menu: &NativeMenu,
     req: &ShowRequest,
     is_tracking: &AtomicBool,
+    shared_host: &SharedCacheHost,
 ) {
-    is_tracking.store(true, Ordering::Release);
-    let _tracking_guard = TrackingGuard(is_tracking);
-    let _binding = MenuBindingGuard::bind(win_state, menu);
-
-    unsafe {
-        let _ = SetWindowPos(
-            popup_hwnd,
-            HWND_TOPMOST,
-            req.anchor_x,
-            req.anchor_y,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOSIZE,
-        );
-        let _ = SetForegroundWindow(popup_hwnd);
-    }
-
-    let selected = menu.track_only(popup_hwnd, (req.anchor_x, req.anchor_y), req.no_animation);
-    unsafe {
-        let _ = PostMessageW(popup_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-    }
-
     let root = HWND(req.explorer_root_hwnd as *mut c_void);
     let defview = HWND(req.defview_hwnd as *mut c_void);
 
+    let _tracking_guard = TrackingGuard::enter(is_tracking, shared_host);
+    shared_host.set_pending_show(false);
+    let got_fg = activate_popup_owner(popup_hwnd, root, req.anchor_x, req.anchor_y);
+    let binding = MenuBindingGuard::bind(win_state, menu, got_fg);
+    let watchdog = got_fg.then(|| WatchdogTimerGuard::arm(popup_hwnd));
+    let dismiss_hooks = TrackDismissHookGuard::install(popup_hwnd);
+
+    let selected = menu.track_only(popup_hwnd, (req.anchor_x, req.anchor_y), req.no_animation);
+    let dismissed_by_click = dismiss_hooks.dismissed_by_outside_click();
+    let was_fg = unsafe { GetForegroundWindow() } == popup_hwnd;
+    drop(dismiss_hooks);
+    drop(watchdog);
+    drop(binding);
+    unsafe {
+        let _ = ShowWindow(popup_hwnd, SW_HIDE);
+        let _ = PostMessageW(popup_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    }
+
     match selected {
         Ok(Some(cmd_id)) if cmd_id == CUSTOMIZE_MENU_CMD_ID => {
-            restore_foreground(popup_hwnd, root);
+            if was_fg {
+                restore_foreground_if_needed(popup_hwnd, root);
+            }
             crate::gui::spawn_manager_for_selection(menu.selection());
         }
         Ok(Some(cmd_id)) => {
@@ -804,7 +1066,9 @@ fn show_and_invoke(
                 && !defview.is_invalid()
                 && unsafe { IsWindow(defview) }.as_bool()
             {
-                restore_foreground(popup_hwnd, root);
+                if was_fg {
+                    focus_explorer(root);
+                }
                 unsafe {
                     let _ = PostMessageW(defview, edit_label_msg_id(), WPARAM(0), LPARAM(0));
                 }
@@ -813,21 +1077,35 @@ fn show_and_invoke(
                 tracing::debug!(%error, "cached menu InvokeCommand failed");
             }
         }
-        Ok(None) => restore_foreground(popup_hwnd, root),
+        Ok(None) => {
+            if was_fg && !dismissed_by_click {
+                restore_foreground_if_needed(popup_hwnd, root);
+            }
+        }
         Err(error) => {
             tracing::debug!(%error, "cached menu TrackPopupMenuEx failed");
-            restore_foreground(popup_hwnd, root);
+            if was_fg && !dismissed_by_click {
+                restore_foreground_if_needed(popup_hwnd, root);
+            }
         }
     }
 }
 
-fn restore_foreground(popup_hwnd: HWND, explorer_root: HWND) {
-    if !explorer_root.is_invalid()
-        && unsafe { IsWindow(explorer_root) }.as_bool()
-        && unsafe { GetForegroundWindow() } == popup_hwnd
-    {
+fn focus_explorer(explorer_root: HWND) {
+    if !explorer_root.is_invalid() && unsafe { IsWindow(explorer_root) }.as_bool() {
         unsafe {
             let _ = SetForegroundWindow(explorer_root);
+        }
+    }
+}
+
+fn restore_foreground_if_needed(popup_hwnd: HWND, explorer_root: HWND) {
+    if !explorer_root.is_invalid() && unsafe { IsWindow(explorer_root) }.as_bool() {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == popup_hwnd || fg.is_invalid() {
+            unsafe {
+                let _ = SetForegroundWindow(explorer_root);
+            }
         }
     }
 }
@@ -905,6 +1183,178 @@ mod tests {
         let t_check = Instant::now();
         assert!(worker.coordinator.lock().unwrap().ready.iter().any(|r| r.key_hash == hash));
         assert!(t_check.elapsed() < Duration::from_millis(20));
+
+        worker.shutdown();
+    }
+
+    #[test]
+    #[ignore = "hosts a real Menu STA thread and tests live popup foreground & dismissal"]
+    fn sta_worker_menu_dismisses_on_cancel_and_foreground_loss() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE, WS_VISIBLE};
+
+        let pump_messages = || {
+            let mut msg = MSG::default();
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        };
+
+        let name = format!(
+            r"Local\RwmStaDismissTest_{}_{}",
+            std::process::id(),
+            NEXT_MAP.fetch_add(1, Ordering::Relaxed)
+        );
+        let shared = Arc::new(SharedCacheHost::create_named(&name).unwrap());
+        let _ole = OleGuard::initialize().unwrap();
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let dummy_hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("RwmDismissTestDummy"),
+                WS_POPUP | WS_VISIBLE,
+                10,
+                10,
+                120,
+                40,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .unwrap();
+        struct DummyGuard(HWND);
+        impl Drop for DummyGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        let _dummy = DummyGuard(dummy_hwnd);
+        unsafe {
+            let _ = SetForegroundWindow(dummy_hwnd);
+        }
+
+        shared.set_host_info(std::process::id(), dummy_hwnd.0 as isize);
+        let worker = MenuCacheWorker::start(Arc::clone(&shared)).unwrap();
+        let client = SharedCacheClient::open_named(&name).unwrap();
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let manifest = repo.join("Cargo.toml");
+        let sel = SelectionKey::from_paths(&[manifest], false, false).unwrap();
+        let clip = clipboard_sequence_number();
+        let hash = sel.cache_key_hash(clip);
+        let mut buf = Vec::new();
+        assert!(sel.serialize_pidls(&mut buf));
+
+        let prefetch_and_wait_ready = || {
+            client.try_write_prefetch(hash, false, clip, &buf).unwrap();
+            worker.on_prefetch_signal();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                pump_messages();
+                if worker
+                    .coordinator
+                    .lock()
+                    .unwrap()
+                    .ready
+                    .iter()
+                    .any(|r| r.key_hash == hash)
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("menu did not reach ready state within 5s");
+        };
+
+        // 1. Open popup menu and verify cancel_active_menu() dismisses it cleanly.
+        prefetch_and_wait_ready();
+        let req = ShowRequest {
+            request_seq: 0,
+            key_hash: hash,
+            clipboard_seq: clip,
+            anchor_x: 120,
+            anchor_y: 120,
+            defview_hwnd: dummy_hwnd.0 as isize,
+            explorer_root_hwnd: dummy_hwnd.0 as isize,
+            no_animation: true,
+        };
+        assert!(client.try_write_show(&req).is_some());
+        assert!(worker.on_claim_show_signal());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.is_tracking.load(Ordering::Acquire) && Instant::now() < deadline {
+            pump_messages();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            worker.is_tracking.load(Ordering::Acquire),
+            "popup menu did not enter tracking"
+        );
+        assert!(client.is_host_tracking());
+        assert!(
+            !worker.on_claim_show_signal(),
+            "claim while tracking must be rejected & cancel"
+        );
+
+        let dismiss_deadline = Instant::now() + Duration::from_secs(1);
+        while (worker.is_tracking.load(Ordering::Acquire) || client.is_host_tracking())
+            && Instant::now() < dismiss_deadline
+        {
+            pump_messages();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !worker.is_tracking.load(Ordering::Acquire) && !client.is_host_tracking(),
+            "menu remained stuck after cancel"
+        );
+
+        // 2. Open popup menu again and verify inactivation / foreground loss dismisses it cleanly.
+        prefetch_and_wait_ready();
+        assert!(client.try_write_show(&req).is_some());
+        assert!(worker.on_claim_show_signal());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.is_tracking.load(Ordering::Acquire) && Instant::now() < deadline {
+            pump_messages();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            worker.is_tracking.load(Ordering::Acquire),
+            "second popup did not enter tracking"
+        );
+        let popup_hwnd = HWND(worker.popup_hwnd.load(Ordering::Acquire) as *mut c_void);
+        assert!(!popup_hwnd.is_invalid());
+        if unsafe { GetForegroundWindow() } == popup_hwnd {
+            unsafe {
+                let _ = SetForegroundWindow(dummy_hwnd);
+            }
+        } else {
+            unsafe {
+                let _ = PostMessageW(popup_hwnd, WM_ACTIVATE, WPARAM(WA_INACTIVE as usize), LPARAM(0));
+            }
+        }
+        let fg_deadline = Instant::now() + Duration::from_secs(1);
+        while (worker.is_tracking.load(Ordering::Acquire) || client.is_host_tracking())
+            && Instant::now() < fg_deadline
+        {
+            pump_messages();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !worker.is_tracking.load(Ordering::Acquire) && !client.is_host_tracking(),
+            "menu remained stuck after losing foreground focus"
+        );
 
         worker.shutdown();
     }

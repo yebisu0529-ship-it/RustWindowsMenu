@@ -22,11 +22,14 @@ pub const CACHE_MAGIC: u32 = 0x5257_4D33; // "RWM3"
 pub const MAX_READY_SLOTS: usize = 8;
 pub const MAX_PREFETCH_BYTES: usize = 16 * 1024;
 const STALE_LOCK_MS: u64 = 250;
+const HOST_STATE_TRACKING: u32 = 1 << 0;
+const HOST_STATE_PENDING_SHOW: u32 = 1 << 1;
 
 static PREFETCH_MSG: AtomicU32 = AtomicU32::new(0);
 static CLAIM_SHOW_MSG: AtomicU32 = AtomicU32::new(0);
 static EDIT_LABEL_MSG: AtomicU32 = AtomicU32::new(0);
 static CONFIG_RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
+static CANCEL_MENU_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Monotonic tick count in milliseconds matching Windows `GetTickCount64`.
 #[inline]
@@ -62,6 +65,11 @@ pub fn edit_label_msg_id() -> u32 {
 /// Window message posted to `rwm-host.exe` when `config.toml` or blocked handlers change.
 pub fn config_reload_msg_id() -> u32 {
     registered_message(&CONFIG_RELOAD_MSG, "RustWindowsMenu.ConfigReload.v3")
+}
+
+/// Window message sent/posted to `rwm-host.exe` to dismiss an active popup menu immediately.
+pub fn cancel_menu_msg_id() -> u32 {
+    registered_message(&CANCEL_MENU_MSG, "RustWindowsMenu.CancelMenu.v3")
 }
 
 /// Signals a running `rwm-host.exe` to reload configuration and drop stale cached menus immediately.
@@ -124,7 +132,7 @@ struct SharedCacheRegion {
     magic: AtomicU32,
     abi_version: AtomicU32,
     host_pid: AtomicU32,
-    _pad0: u32,
+    host_tracking: AtomicU32,
     host_hwnd: AtomicU64,
     in_flight_hash: AtomicU64,
     next_request_seq: AtomicU64,
@@ -291,6 +299,25 @@ impl SharedCacheHost {
             .store(key_hash, Ordering::Release);
     }
 
+    fn update_tracking_bit(&self, bit: u32, enabled: bool) {
+        let state = &self.mapping.region().host_tracking;
+        if enabled {
+            state.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            state.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+
+    /// Sets or clears the live popup tracking bit in `host_tracking`.
+    pub fn set_tracking(&self, tracking: bool) {
+        self.update_tracking_bit(HOST_STATE_TRACKING, tracking);
+    }
+
+    /// Sets or clears the pending show handoff bit in `host_tracking` to prevent concurrent menus.
+    pub fn set_pending_show(&self, pending: bool) {
+        self.update_tracking_bit(HOST_STATE_PENDING_SHOW, pending);
+    }
+
     /// Replaces the published lock-free lookup table of cached `(key_hash, expires_tick_ms)` entries.
     pub fn publish_slots(&self, entries: &[(u64, u64)]) {
         let region = self.mapping.region();
@@ -378,6 +405,7 @@ impl SharedCacheHost {
 impl Drop for SharedCacheHost {
     fn drop(&mut self) {
         let region = self.mapping.region();
+        region.host_tracking.store(0, Ordering::Release);
         region.host_hwnd.store(0, Ordering::Release);
         region.host_pid.store(0, Ordering::Release);
         region.in_flight_hash.store(0, Ordering::Release);
@@ -421,6 +449,18 @@ impl SharedCacheClient {
     #[inline]
     pub fn host_hwnd(&self) -> isize {
         self.mapping.region().host_hwnd.load(Ordering::Acquire) as isize
+    }
+
+    /// Lock-free check whether `rwm-host.exe` currently has an active context menu open.
+    #[inline]
+    pub fn is_host_tracking(&self) -> bool {
+        self.is_valid()
+            && self
+                .mapping
+                .region()
+                .host_tracking
+                .load(Ordering::Acquire)
+                != 0
     }
 
     /// Lock-free, zero-allocation readiness check (approx. 15 ns).
@@ -545,6 +585,21 @@ mod tests {
         assert!(client.is_valid());
         assert_eq!(client.host_pid(), 1234);
         assert_eq!(client.host_hwnd(), 0xABCD);
+        assert!(!client.is_host_tracking());
+        host.set_tracking(true);
+        assert!(client.is_host_tracking());
+        host.set_pending_show(true);
+        assert!(client.is_host_tracking());
+        host.set_tracking(false);
+        assert!(client.is_host_tracking());
+        host.set_pending_show(false);
+        assert!(!client.is_host_tracking());
+        host.set_pending_show(true);
+        host.set_tracking(true);
+        host.set_pending_show(false);
+        assert!(client.is_host_tracking());
+        host.set_tracking(false);
+        assert!(!client.is_host_tracking());
 
         host.publish_slots(&[(0x1111, 5000), (0x2222, 100)]);
         host.set_in_flight(0x3333);

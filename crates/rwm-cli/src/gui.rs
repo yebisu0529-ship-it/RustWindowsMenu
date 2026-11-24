@@ -953,6 +953,7 @@ pub fn run(initial_target: Option<PathBuf>, initial_background: bool) -> CliResu
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
         start_background_inspect(&mut *state_ptr);
     }
 

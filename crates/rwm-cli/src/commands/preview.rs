@@ -6,14 +6,16 @@ use std::process::ExitCode;
 use rwm_core::config::RwmConfig;
 use rwm_core::shell::{enable_dark_mode_menus, NativeMenu, OleGuard, CUSTOMIZE_MENU_CMD_ID};
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, PostMessageW, RegisterClassExW,
-    SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA, WM_NULL, WNDCLASSEXW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EndMenu, GetCursorPos, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    ShowWindow, GWLP_USERDATA, LWA_ALPHA, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE,
+    WM_ACTIVATEAPP, WM_CANCELMODE, WM_NULL, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::cli::PreviewArgs;
@@ -31,7 +33,12 @@ unsafe extern "system" fn window_proc(
         let menu = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
             as *const NativeMenu;
         if !menu.is_null() {
-            if let Some(result) = (*menu).handle_menu_msg(message, wparam, lparam) {
+            if (message == WM_ACTIVATE && (wparam.0 & 0xFFFF) == WA_INACTIVE as usize)
+                || (message == WM_ACTIVATEAPP && wparam.0 == 0)
+                || message == WM_CANCELMODE
+            {
+                let _ = EndMenu();
+            } else if let Some(result) = (*menu).handle_menu_msg(message, wparam, lparam) {
                 return Some(result);
             }
         }
@@ -91,10 +98,10 @@ pub fn run(args: &PreviewArgs) -> CliResult<ExitCode> {
     let owner = Window(
         unsafe {
             CreateWindowExW(
-                Default::default(),
+                WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                 w!("RustWindowsMenuPreview"),
                 w!("RustWindowsMenu preview"),
-                WS_OVERLAPPED,
+                WS_POPUP,
                 0,
                 0,
                 1,
@@ -107,6 +114,9 @@ pub fn run(args: &PreviewArgs) -> CliResult<ExitCode> {
         }
         .context(|| "cannot create preview owner window".to_string())?,
     );
+    unsafe {
+        let _ = SetLayeredWindowAttributes(owner.0, COLORREF(0), 0, LWA_ALPHA);
+    }
     print_line(format!("Target: {}", target.describe()));
     let mut menu = NativeMenu::build_from_paths(
         owner.0,
@@ -121,19 +131,31 @@ pub fn run(args: &PreviewArgs) -> CliResult<ExitCode> {
     let _binding = MenuBindingGuard::bind(owner.0, &menu);
     let mut cursor = POINT::default();
     unsafe { GetCursorPos(&mut cursor) }.context(|| "cannot read cursor position".to_string())?;
-    let _ = unsafe { SetForegroundWindow(owner.0) };
+    unsafe {
+        let _ = ShowWindow(owner.0, SW_SHOW);
+        let _ = SetForegroundWindow(owner.0);
+    }
     let selected = match menu.track_only(owner.0, (cursor.x, cursor.y), args.no_animation)? {
         Some(cmd_id) if cmd_id == CUSTOMIZE_MENU_CMD_ID => {
+            unsafe {
+                let _ = ShowWindow(owner.0, SW_HIDE);
+            }
             crate::gui::spawn_manager_for_selection(menu.selection());
             Some(cmd_id)
         }
         Some(cmd_id) => {
+            unsafe {
+                let _ = ShowWindow(owner.0, SW_HIDE);
+            }
             menu.invoke_id(cmd_id, owner.0, (cursor.x, cursor.y))?;
             Some(cmd_id)
         }
         None => None,
     };
-    let _ = unsafe { PostMessageW(owner.0, WM_NULL, WPARAM(0), LPARAM(0)) };
+    unsafe {
+        let _ = ShowWindow(owner.0, SW_HIDE);
+        let _ = PostMessageW(owner.0, WM_NULL, WPARAM(0), LPARAM(0));
+    }
     print_line(selected.map_or_else(
         || "Menu closed without a selection.".to_string(),
         |id| format!("Invoked menu command ID {id}."),

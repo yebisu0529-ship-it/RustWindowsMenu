@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use rwm_core::config::RwmConfig;
 use rwm_core::ipc_cache::{
-    claim_show_msg_id, config_reload_msg_id, prefetch_msg_id, SharedCacheHost,
+    cancel_menu_msg_id, claim_show_msg_id, config_reload_msg_id, prefetch_msg_id, SharedCacheHost,
 };
 use rwm_core::shell::{enable_dark_mode_menus, is_japanese_ui};
 use windows::core::{w, Interface, BSTR, PCWSTR, VARIANT};
@@ -573,6 +573,7 @@ struct WindowState<'a> {
     prefetch_msg: u32,
     claim_show_msg: u32,
     config_reload_msg: u32,
+    cancel_menu_msg: u32,
     tray_icon: Option<&'a TrayIconGuard>,
 }
 impl WindowState<'_> {
@@ -719,6 +720,12 @@ unsafe extern "system" fn window_proc(
             if message == (*state).config_reload_msg {
                 if let Some(worker) = (*state).menu_cache {
                     worker.on_config_reload_signal();
+                }
+                return Some(LRESULT(1));
+            }
+            if message == (*state).cancel_menu_msg {
+                if let Some(worker) = (*state).menu_cache {
+                    worker.cancel_active_menu();
                 }
                 return Some(LRESULT(1));
             }
@@ -910,6 +917,7 @@ pub fn run() -> CliResult<ExitCode> {
         prefetch_msg: prefetch_msg_id(),
         claim_show_msg: claim_show_msg_id(),
         config_reload_msg: config_reload_msg_id(),
+        cancel_menu_msg: cancel_menu_msg_id(),
         tray_icon: Some(&tray_icon),
     };
     unsafe {

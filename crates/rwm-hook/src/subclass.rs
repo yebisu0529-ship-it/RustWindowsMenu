@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use rwm_core::config::{local_data_dir, RwmConfig};
 use rwm_core::ipc_cache::{
-    claim_show_msg_id, now_tick_ms, prefetch_msg_id, SharedCacheClient, ShowRequest,
+    cancel_menu_msg_id, claim_show_msg_id, now_tick_ms, prefetch_msg_id, SharedCacheClient,
+    ShowRequest,
 };
 use rwm_core::shell::{
     clipboard_sequence_number, NativeMenu, SelectionKey, ShellError, CUSTOMIZE_MENU_CMD_ID,
@@ -608,6 +609,7 @@ fn route(
             None
         }
         (false, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_KEYDOWN) => {
+            dismiss_host_menu_if_tracking();
             reset(defview);
             None
         }
@@ -804,6 +806,7 @@ fn right_button_down(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    dismiss_host_menu_if_tracking();
     cancel_speculative_timers(defview);
     let stale = swap_gesture(defview, Gesture::Idle);
     // Explorer moves the selection and focus on the press itself, so it goes first.
@@ -1022,6 +1025,45 @@ fn launch_manager_ui(selection: &SelectionKey) {
         .spawn();
 }
 
+fn dismiss_host_menu_if_tracking() {
+    let target = with_state(|state| {
+        let client = ensure_cache_client(state)?;
+        client
+            .is_host_tracking()
+            .then(|| HWND(client.host_hwnd() as *mut c_void))
+    })
+    .flatten();
+    let Some(host_hwnd) = target else {
+        return;
+    };
+    let mut reply = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            host_hwnd,
+            cancel_menu_msg_id(),
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            40,
+            Some(&mut reply),
+        )
+    };
+    if sent.0 == 0 {
+        let _ = unsafe { PostMessageW(host_hwnd, cancel_menu_msg_id(), WPARAM(0), LPARAM(0)) };
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(30);
+    while Instant::now() < deadline {
+        let still = with_state(|state| {
+            ensure_cache_client(state).is_some_and(SharedCacheClient::is_host_tracking)
+        })
+        .unwrap_or(false);
+        if !still {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn try_claim_host_show(
     defview: HWND,
     key: &SelectionKey,
@@ -1084,6 +1126,7 @@ enum ContextDecision {
 
 /// Shows the native menu for one `WM_CONTEXTMENU`. `None` leaves the message to Explorer.
 fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    dismiss_host_menu_if_tracking();
     cancel_speculative_timers(defview);
     let (prebuilt, hit_cache) =
         swap_gesture(defview, Gesture::Idle).take_for_context_menu(Instant::now());
