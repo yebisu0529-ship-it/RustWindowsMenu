@@ -2,16 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::core::{w, PCWSTR};
+use rwm_core::ipc_cache::{claim_show_msg_id, prefetch_msg_id, SharedCacheHost};
+use windows::core::{w, Interface, BSTR, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
     HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch, IServiceProvider,
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
     CTRL_SHUTDOWN_EVENT,
@@ -23,18 +29,23 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Shell::{
+    CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView, IShellWindows,
+    SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetShellWindow, GetWindowThreadProcessId, KillTimer, MsgWaitForMultipleObjects, PeekMessageW,
     PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_CREATE, GWLP_USERDATA,
-    HHOOK, MSG, PM_REMOVE, QS_ALLINPUT, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
+    HHOOK, MSG, PM_REMOVE, QS_ALLINPUT, SW_HIDE, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_DESTROY, WM_QUIT, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::error::{CliError, CliResult, Context};
 use crate::explorer::{self, Delivery, ShellWindow};
 use crate::hookdll::{self, HookLibrary};
+use crate::menu_cache::MenuCacheWorker;
 use crate::output::print_line;
 
 pub const HOST_MUTEX_NAME: &str = r"Local\RustWindowsMenuHost_v2";
@@ -478,6 +489,9 @@ impl Drop for HookSession<'_> {
 struct WindowState<'a> {
     session: HookSession<'a>,
     taskbar_created: u32,
+    menu_cache: Option<&'a MenuCacheWorker>,
+    prefetch_msg: u32,
+    claim_show_msg: u32,
 }
 impl WindowState<'_> {
     fn rescan(&mut self) {
@@ -527,18 +541,31 @@ unsafe extern "system" fn window_proc(
             hwnd,
             GWLP_USERDATA,
         ) as *mut WindowState<'_>;
-        if !state.is_null()
-            && (message == (*state).taskbar_created
-                || (message == WM_TIMER && matches!(wparam.0, DEBOUNCE_TIMER | SWEEP_TIMER)))
-        {
-            if message == WM_TIMER {
-                let _ = KillTimer(hwnd, wparam.0);
+        if !state.is_null() {
+            if message == (*state).prefetch_msg {
+                if let Some(worker) = (*state).menu_cache {
+                    worker.on_prefetch_signal();
+                }
+                return Some(LRESULT(1));
             }
-            if message == WM_TIMER && wparam.0 == SWEEP_TIMER {
-                let _ = SetTimer(hwnd, SWEEP_TIMER, 5000, None);
+            if message == (*state).claim_show_msg {
+                let claimed = (*state)
+                    .menu_cache
+                    .is_some_and(MenuCacheWorker::on_claim_show_signal);
+                return Some(LRESULT(isize::from(claimed)));
             }
-            (*state).rescan();
-            return Some(LRESULT(0));
+            if message == (*state).taskbar_created
+                || (message == WM_TIMER && matches!(wparam.0, DEBOUNCE_TIMER | SWEEP_TIMER))
+            {
+                if message == WM_TIMER {
+                    let _ = KillTimer(hwnd, wparam.0);
+                }
+                if message == WM_TIMER && wparam.0 == SWEEP_TIMER {
+                    let _ = SetTimer(hwnd, SWEEP_TIMER, 5000, None);
+                }
+                (*state).rescan();
+                return Some(LRESULT(0));
+            }
         }
         if message == WM_DESTROY {
             PostQuitMessage(0);
@@ -683,9 +710,21 @@ pub fn run() -> CliResult<ExitCode> {
         return Err(CliError::new("SetWinEventHook failed"));
     }
     let _event_guard = WinEventGuard(event_hook);
+    let shared_cache = SharedCacheHost::create()
+        .map(Arc::new)
+        .map_err(|error| tracing::warn!("shared menu cache unavailable: {error}"))
+        .ok();
+    let mut menu_cache = shared_cache.and_then(|shared| {
+        MenuCacheWorker::start(shared)
+            .map_err(|error| tracing::warn!("menu STA worker unavailable: {error}"))
+            .ok()
+    });
     let mut state = WindowState {
         session: HookSession::new(&library),
         taskbar_created,
+        menu_cache: menu_cache.as_ref(),
+        prefetch_msg: prefetch_msg_id(),
+        claim_show_msg: claim_show_msg_id(),
     };
     unsafe {
         SetWindowLongPtrW(
@@ -693,6 +732,11 @@ pub fn run() -> CliResult<ExitCode> {
             GWLP_USERDATA,
             &mut state as *mut WindowState<'_> as isize,
         );
+    }
+    if let Some(worker) = &menu_cache {
+        worker
+            .shared_host()
+            .set_host_info(std::process::id(), hwnd.0 .0 as isize);
     }
     signal.mark_ready()?;
     state.rescan();
@@ -729,6 +773,9 @@ pub fn run() -> CliResult<ExitCode> {
     drop(_event_guard);
     drop(hwnd);
     drop(state);
+    if let Some(worker) = menu_cache.take() {
+        worker.shutdown();
+    }
     drop(library);
     print_line(format!(
         "Host detached {} Explorer hook(s); {} window acknowledgement(s).",
@@ -743,6 +790,82 @@ pub fn start() -> CliResult<ExitCode> {
     start_host_exe(&exe.with_file_name("rwm-host.exe"))?;
     print_line("rwm-host started and initialized successfully.");
     Ok(ExitCode::SUCCESS)
+}
+
+enum DesktopLaunchError {
+    TimedOut,
+    Failed(String),
+}
+
+/// Decoupled host launch via Explorer's own desktop shell (`IShellDispatch2::ShellExecute`, modeled
+/// after `RustWTM/crates/wtm-sys/src/shell.rs`) so parent terminal/job exits cannot kill `rwm-host`.
+fn launch_via_desktop_shell(host_exe: &Path) -> Result<(), DesktopLaunchError> {
+    let exe_str = host_exe.to_string_lossy().into_owned();
+    let dir_str = host_exe
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("rwm-desktop-launch".into())
+        .spawn(move || {
+            let initialized =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+            let outcome = (|| -> windows::core::Result<()> {
+                unsafe {
+                    let windows: IShellWindows =
+                        CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+                    let desktop = VARIANT::from(CSIDL_DESKTOP as i32);
+                    let root = VARIANT::default();
+                    let mut window = 0i32;
+                    let found: IDispatch = windows.FindWindowSW(
+                        &desktop,
+                        &root,
+                        SWC_DESKTOP,
+                        &mut window,
+                        SWFO_NEEDDISPATCH,
+                    )?;
+                    let provider: IServiceProvider = found.cast()?;
+                    let browser: IShellBrowser = provider.QueryService(&SID_STopLevelBrowser)?;
+                    let view: IShellView = browser.QueryActiveShellView()?;
+                    let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
+                    let folder: IShellFolderViewDual = background.cast()?;
+                    let shell: IShellDispatch2 = folder.Application()?.cast()?;
+                    shell.ShellExecute(
+                        &BSTR::from(exe_str.as_str()),
+                        &VARIANT::default(),
+                        &VARIANT::from(BSTR::from(dir_str.as_str())),
+                        &VARIANT::from(BSTR::from("open")),
+                        &VARIANT::from(SW_HIDE.0),
+                    )
+                }
+            })();
+            if initialized {
+                unsafe { CoUninitialize() };
+            }
+            let _ = tx.send(outcome.map_err(|e| e.message()));
+        })
+        .map_err(|e| DesktopLaunchError::Failed(e.to_string()))?;
+
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(DesktopLaunchError::Failed(msg)),
+        Err(_) => Err(DesktopLaunchError::TimedOut),
+    }
+}
+
+fn spawn_host_direct(host_exe: &Path) -> CliResult<Child> {
+    let mut command = Command::new(host_exe);
+    if let Some(dir) = host_exe.parent() {
+        command.current_dir(dir);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .spawn()
+        .context(|| format!("cannot launch {}", host_exe.display()))
 }
 
 pub fn start_host_exe(host_exe: &Path) -> CliResult<()> {
@@ -772,31 +895,42 @@ pub fn start_host_exe(host_exe: &Path) -> CliResult<()> {
             host_exe.display()
         )));
     }
-    let mut command = Command::new(host_exe);
-    if let Some(dir) = host_exe.parent() {
-        command.current_dir(dir);
-    }
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .spawn()
-        .context(|| format!("cannot launch {}", host_exe.display()))?;
+    let use_desktop = std::env::var_os("RWM_DIRECT_SPAWN").is_none()
+        && std::env::var_os("CI").is_none();
+    let mut direct_child = if use_desktop {
+        match launch_via_desktop_shell(host_exe) {
+            Ok(()) => None,
+            Err(DesktopLaunchError::TimedOut) => {
+                tracing::debug!("desktop shell launch timed out; polling readiness");
+                None
+            }
+            Err(DesktopLaunchError::Failed(reason)) => {
+                tracing::warn!(%reason, "desktop shell launch failed; using direct spawn");
+                Some(spawn_host_direct(host_exe)?)
+            }
+        }
+    } else {
+        Some(spawn_host_direct(host_exe)?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if is_host_ready() {
             return Ok(());
         }
-        if let Some(status) = child.try_wait()? {
-            return Err(CliError::new(format!(
-                "rwm-host exited during initialization ({status})"
-            )));
+        if let Some(child) = &mut direct_child {
+            if let Some(status) = child.try_wait()? {
+                return Err(CliError::new(format!(
+                    "rwm-host exited during initialization ({status})"
+                )));
+            }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     let _ = stop_running_host(HOST_MUTEX_NAME, HOST_EVENT_NAME, Duration::from_secs(2));
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Some(mut child) = direct_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     Err(CliError::new(
         "rwm-host did not initialize within 5 seconds",
     ))

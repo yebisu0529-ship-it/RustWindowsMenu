@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "rwm",
     version,
-    about = "RustWindowsMenu 0.2: fast native Windows menus",
+    about = "RustWindowsMenu 0.3: ultra-fast native Windows menus",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -27,6 +27,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     Bench(BenchArgs),
     Inspect(InspectArgs),
+    Optimize(OptimizeArgs),
     Preview(PreviewArgs),
     Handlers {
         #[command(subcommand)]
@@ -98,6 +99,20 @@ pub struct InspectArgs {
     pub target: TargetArgs,
     #[arg(long)]
     pub extended: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, default_value_t = 30_000, hide = true)]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct OptimizeArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[arg(long, default_value_t = 25.0)]
+    pub threshold_ms: f64,
+    #[arg(long)]
+    pub apply: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long, default_value_t = 30_000, hide = true)]
@@ -207,6 +222,8 @@ mod tests {
             vec!["rwm", "doctor", "--background", "--json"],
             vec!["rwm", "bench", "--runs", "3", "--json"],
             vec!["rwm", "inspect", "--extended", "--json"],
+            vec!["rwm", "optimize", "--threshold-ms", "25", "--json"],
+            vec!["rwm", "optimize", "--apply"],
             vec!["rwm", "preview", "--extended", "--no-animation"],
             vec!["rwm", "handlers", "list", "--json"],
             vec![

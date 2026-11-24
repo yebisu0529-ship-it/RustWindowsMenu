@@ -61,7 +61,7 @@ pub fn run(action: ConfigAction) -> CliResult<ExitCode> {
         ConfigAction::Reset => {
             RwmConfig::default().save()?;
             print_line(format!(
-                "Reset config to v0.2 defaults: {}",
+                "Reset config to v0.3 defaults: {}",
                 config_path().display()
             ));
         }
@@ -72,7 +72,7 @@ pub fn run(action: ConfigAction) -> CliResult<ExitCode> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn example_config_parses_strictly_as_v02() {
+    fn example_config_parses_strictly_as_v03() {
         let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../config.example.toml"

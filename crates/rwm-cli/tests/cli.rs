@@ -39,7 +39,7 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 #[test]
-fn help_lists_complete_v02_surface_and_hides_probe_worker() {
+fn help_lists_complete_v03_surface_and_hides_probe_worker() {
     let scratch = Scratch::new("help");
     let help = stdout(&run(rwm(&scratch).arg("--help")));
     for command in [
@@ -51,6 +51,7 @@ fn help_lists_complete_v02_surface_and_hides_probe_worker() {
         "doctor",
         "bench",
         "inspect",
+        "optimize",
         "preview",
         "handlers",
         "classic",
@@ -104,9 +105,10 @@ fn read_only_status_and_handlers_json_are_machine_readable() {
         String::from_utf8_lossy(&status.stderr)
     );
     let report = json(&status);
-    assert_eq!(report["abi_version"], 2);
+    assert_eq!(report["abi_version"], 3);
     assert!(report["config"]["valid"].as_bool().unwrap());
     assert!(report["host_running"].is_boolean());
+    assert!(report["host_cache_active"].is_boolean());
     let handlers = run(rwm(&scratch).args(["handlers", "list", "--json"]));
     assert!(handlers.status.success());
     assert!(json(&handlers).is_array());
@@ -115,7 +117,7 @@ fn read_only_status_and_handlers_json_are_machine_readable() {
 #[test]
 fn invalid_targets_fail_before_any_shell_or_registry_change() {
     let scratch = Scratch::new("target");
-    for command in ["inspect", "bench", "preview"] {
+    for command in ["inspect", "bench", "optimize", "preview"] {
         let output = run(rwm(&scratch)
             .arg(command)
             .arg(scratch.0.join("missing.txt")));

@@ -54,6 +54,7 @@ const PRF_CHILDREN: isize = 0x10;
 enum DemoMode {
     Windows,
     Rwm,
+    RwmCached,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,10 @@ fn parse_args() -> Args {
                 parsed.warm = false;
                 continue;
             }
+            "--cached" => {
+                parsed.mode = DemoMode::RwmCached;
+                continue;
+            }
             _ => {}
         }
         let value = args
@@ -149,7 +154,8 @@ fn parse_args() -> Args {
                 parsed.mode = match value.as_str() {
                     "windows" => DemoMode::Windows,
                     "rwm" => DemoMode::Rwm,
-                    _ => panic!("--mode must be windows or rwm"),
+                    "rwm-cached" => DemoMode::RwmCached,
+                    _ => panic!("--mode must be windows, rwm, or rwm-cached"),
                 };
             }
             "--file" => parsed.file = value.into(),
@@ -219,7 +225,7 @@ fn paint_backdrop_dc(hdc: HDC, state: &WindowState) {
         };
         let accent = match state.mode {
             DemoMode::Windows => 0x0044_44EF,
-            DemoMode::Rwm => 0x0081_B910,
+            DemoMode::Rwm | DemoMode::RwmCached => 0x0081_B910,
         };
 
         fill_solid(hdc, &RECT { left: 0, top: 0, right: W, bottom: H }, bg_dark);
@@ -239,8 +245,12 @@ fn paint_backdrop_dc(hdc: HDC, state: &WindowState) {
                 "Builds synchronously on release + fade animation",
             ),
             DemoMode::Rwm => (
-                "RustWindowsMenu v0.2.0 (Time-Shifted Native)",
-                "Prebuilt during hold + TPM_NOANIMATION (100% OS / MSIX / COM)",
+                "RustWindowsMenu v0.3.0 (Time-Shifted Native)",
+                "Prebuilt on RButtonDown + TPM_NOANIMATION (100% OS / MSIX / COM)",
+            ),
+            DemoMode::RwmCached => (
+                "RustWindowsMenu v0.3.0 (Speculative Cache)",
+                "Prebuilt on hover off UI thread + TPM_NOANIMATION (100% OS / MSIX / COM)",
             ),
         };
         draw_text(hdc, title_font, title, &mut RECT { left: 20, top: 10, right: W - 20, bottom: 38 }, 0x00FA_FAFA, false);
@@ -596,14 +606,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = UpdateWindow(owner.0);
     }
 
-    if args.warm {
+    let prebuilt_cached = if args.mode == DemoMode::RwmCached {
+        Some(NativeMenu::build_from_paths(
+            owner.0,
+            std::slice::from_ref(&args.file),
+            args.background,
+            false,
+        )?)
+    } else if args.warm {
         let _ = NativeMenu::build_from_paths(
             owner.0,
             std::slice::from_ref(&args.file),
             args.background,
             false,
         )?;
-    }
+        None
+    } else {
+        None
+    };
 
     if let Some(ref dir) = args.record_dir {
         fs::write(dir.join("idle_bg.bgra"), render_backdrop_bgra(&state))?;
@@ -618,7 +638,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.phase = Phase::Holding;
     state.status_line = match args.mode {
         DemoMode::Windows => "Right-button pressed (holding 100 ms)...".into(),
-        DemoMode::Rwm => "Button pressed -> 15 ms arm -> prebuilding menu during hold...".into(),
+        DemoMode::Rwm => "Button pressed -> t=0 ms host prefetch during hold...".into(),
+        DemoMode::RwmCached => {
+            "Hovered >=120 ms -> menu already cached in rwm-host! Waiting for release...".into()
+        }
     };
     unsafe {
         let _ = InvalidateRect(owner.0, None, false);
@@ -633,8 +656,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let press_start = Instant::now();
     let hold = Duration::from_millis(u64::from(args.button_hold_ms));
     let (actual_release_us, menu) = match args.mode {
+        DemoMode::RwmCached => {
+            pump_for(u64::from(args.button_hold_ms));
+            let rel = t_origin.elapsed().as_micros() as u64;
+            (rel, prebuilt_cached.expect("cached menu"))
+        }
         DemoMode::Rwm => {
-            pump_for(15);
             let menu = NativeMenu::build_from_paths(
                 owner.0,
                 std::slice::from_ref(&args.file),
@@ -669,7 +696,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.phase = Phase::Released;
     state.status_line = match args.mode {
         DemoMode::Windows => "Menu ready after synchronous block -> fading in...".into(),
-        DemoMode::Rwm => "Released -> instant TrackPopupMenuEx(TPM_NOANIMATION)!".into(),
+        DemoMode::Rwm | DemoMode::RwmCached => {
+            "Released -> instant TrackPopupMenuEx(TPM_NOANIMATION)!".into()
+        }
     };
     unsafe {
         let _ = InvalidateRect(owner.0, None, false);
@@ -704,7 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(close_ms + 120));
             let _ = unsafe { PostMessageW(HWND(hwnd_val as *mut _), WM_CANCELMODE, WPARAM(0), LPARAM(0)) };
         });
-        let no_animation = args.mode == DemoMode::Rwm;
+        let no_animation = matches!(args.mode, DemoMode::Rwm | DemoMode::RwmCached);
         let _ = menu.track_and_invoke(owner.0, anchor, no_animation)?;
         let _ = unsafe { PostMessageW(owner.0, WM_NULL, WPARAM(0), LPARAM(0)) };
     }
@@ -719,6 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args.mode {
             DemoMode::Windows => "windows",
             DemoMode::Rwm => "rwm",
+            DemoMode::RwmCached => "rwm-cached",
         },
         query_ms,
         items,
@@ -748,6 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: match args.mode {
                 DemoMode::Windows => "windows".into(),
                 DemoMode::Rwm => "rwm".into(),
+                DemoMode::RwmCached => "rwm-cached".into(),
             },
             w: W,
             h: H,

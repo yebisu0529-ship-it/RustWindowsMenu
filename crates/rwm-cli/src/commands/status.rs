@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rwm_core::build_info::{ABI_VERSION, BUILD_ID};
+use rwm_core::ipc_cache::SharedCacheClient;
 use rwm_core::{classic, handlers};
 use serde::Serialize;
 
@@ -20,6 +21,7 @@ struct StatusReport {
     hook_dll: Option<HookDllProbe>,
     searched: Vec<PathBuf>,
     host_running: bool,
+    host_cache_active: bool,
     classic: Option<classic::ClassicStatus>,
     classic_error: Option<String>,
     blocked_handlers: usize,
@@ -32,6 +34,7 @@ pub fn run(json: bool) -> CliResult<ExitCode> {
     let classic = classic::status().map_err(|error| error.to_string());
     let blocked = handlers::list_blocked().map_err(|error| error.to_string());
     let host = host::host_state(host::HOST_MUTEX_NAME);
+    let host_cache_active = SharedCacheClient::open().is_some_and(|c| c.is_valid());
     let report = StatusReport {
         version: env!("CARGO_PKG_VERSION"),
         build_id: BUILD_ID,
@@ -39,6 +42,7 @@ pub fn run(json: bool) -> CliResult<ExitCode> {
         config: config::state(),
         searched: hookdll::candidate_paths(&exe),
         host_running: host != host::HostState::Stopped,
+        host_cache_active,
         classic: classic.as_ref().ok().cloned(),
         classic_error: classic.err(),
         blocked_handlers: blocked.as_ref().map_or(0, Vec::len),
@@ -79,6 +83,9 @@ pub fn run(json: bool) -> CliResult<ExitCode> {
             (
                 "Host",
                 match host {
+                    host::HostState::Running if report.host_cache_active => {
+                        "running (speculative cache active)".into()
+                    }
                     host::HostState::Running => "running".into(),
                     host::HostState::RunningOtherIntegrity => {
                         "running (another integrity level)".into()

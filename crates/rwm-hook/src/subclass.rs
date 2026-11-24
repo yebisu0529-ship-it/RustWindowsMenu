@@ -10,24 +10,31 @@ use std::mem;
 use std::time::Instant;
 
 use rwm_core::config::RwmConfig;
-use rwm_core::shell::{NativeMenu, SelectionKey, ShellError};
+use rwm_core::ipc_cache::{
+    claim_show_msg_id, now_tick_ms, prefetch_msg_id, SharedCacheClient, ShowRequest,
+};
+use rwm_core::shell::{clipboard_sequence_number, NativeMenu, SelectionKey, ShellError};
 use rwm_core::warm_pool::WarmDllPin;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_UPDATENOW};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::UpdateWindow;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_RBUTTON, VK_SHIFT,
+    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 // Not GetWindowSubclass: System32's comctl32 5.82 does not export it by name, so importing it
 // would stop this DLL loading in any process without a common controls v6 manifest.
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EndMenu, GetParent, GetSystemMetrics, IsChild, KillTimer, PostMessageW, SetTimer, SM_CXDRAG,
+    AllowSetForegroundWindow, EndMenu, GetParent, GetSystemMetrics, IsChild, KillTimer,
+    PostMessageW, SendMessageTimeoutW, SetTimer, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SM_CXDRAG,
     SM_CYDRAG, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_CREATE, WM_DRAWITEM,
-    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MEASUREITEM, WM_MENUCHAR,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_TIMER,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MEASUREITEM, WM_MENUCHAR, WM_MOUSEMOVE, WM_NCDESTROY, WM_PARENTNOTIFY, WM_RBUTTONDOWN,
+    WM_TIMER,
 };
 
-use crate::gesture::{self, Gesture, Hit, READY_TTL};
+use crate::gesture::{self, Gesture, Hit, HoverAction, HoverTracker, READY_TTL};
 use crate::settings::ConfigCache;
 use crate::shell_view::{self, ShellView};
 use crate::{Protocol, FAULT};
@@ -36,7 +43,12 @@ pub(crate) const VIEW_SUBCLASS_ID: usize = 0x5257_4D01;
 pub(crate) const CHILD_SUBCLASS_ID: usize = 0x5257_4D02;
 const ARM_TIMER_BASE: usize = 0x5257_4D00;
 const READY_TIMER_BASE: usize = 0x5257_4E00;
+const HOVER_TIMER_BASE: usize = 0x5257_4F00;
+const SELECT_TIMER_BASE: usize = 0x5257_5000;
 const TIMER_SLOTS: usize = 256;
+const HOVER_DEADZONE_PX: i32 = 3;
+const SELECT_DWELL_MS: u32 = 80;
+const CLAIM_SHOW_TIMEOUT_MS: u32 = 25;
 
 fn timer_id_for(base: usize, gen: u64) -> usize {
     base + (gen as usize & (TIMER_SLOTS - 1))
@@ -49,6 +61,9 @@ fn in_timer_band(id: usize, base: usize) -> bool {
 struct View {
     defview: HWND,
     gesture: Gesture<NativeMenu>,
+    hover: HoverTracker,
+    hover_timer: Option<(HWND, usize)>,
+    select_timer: Option<(HWND, usize)>,
     gen: u64,
 }
 
@@ -59,6 +74,8 @@ struct ThreadState {
     deferred_warm: Option<WarmDllPin>,
     deferred_detach: Vec<HWND>,
     config: ConfigCache,
+    cache_client: Option<SharedCacheClient>,
+    prefetch_scratch: Vec<u8>,
     /// Between an attach and a detach, views and item lists this thread creates are adopted as
     /// they appear: navigation replaces the `SHELLDLL_DefView`, and the new view's item list
     /// is created later without announcing itself through `WM_PARENTNOTIFY`.
@@ -149,6 +166,18 @@ fn with_view<R>(defview: HWND, f: impl FnOnce(&mut View) -> R) -> Option<R> {
     .flatten()
 }
 
+fn ensure_cache_client(state: &mut ThreadState) -> Option<&SharedCacheClient> {
+    if state
+        .cache_client
+        .as_ref()
+        .is_some_and(SharedCacheClient::is_valid)
+    {
+        return state.cache_client.as_ref();
+    }
+    state.cache_client = SharedCacheClient::open();
+    state.cache_client.as_ref()
+}
+
 fn kill_gesture_timers(gesture: &Gesture<NativeMenu>) {
     if let Some((child, timer_id)) = gesture.armed_timer() {
         let _ = unsafe { KillTimer(child, timer_id) };
@@ -156,6 +185,20 @@ fn kill_gesture_timers(gesture: &Gesture<NativeMenu>) {
     if let Some((child, timer_id)) = gesture.ready_timer() {
         let _ = unsafe { KillTimer(child, timer_id) };
     }
+}
+
+fn kill_view_speculative_timers(view: &mut View) {
+    if let Some((child, id)) = view.hover_timer.take() {
+        let _ = unsafe { KillTimer(child, id) };
+    }
+    if let Some((child, id)) = view.select_timer.take() {
+        let _ = unsafe { KillTimer(child, id) };
+    }
+    view.hover.reset();
+}
+
+fn cancel_speculative_timers(defview: HWND) {
+    with_view(defview, kill_view_speculative_timers);
 }
 
 /// Installs `next` and returns the previous gesture with its timers killed, for the caller
@@ -181,6 +224,7 @@ fn swap_gesture(defview: HWND, next: Gesture<NativeMenu>) -> Gesture<NativeMenu>
 }
 
 fn reset(defview: HWND) {
+    cancel_speculative_timers(defview);
     drop(swap_gesture(defview, Gesture::Idle));
 }
 
@@ -199,6 +243,65 @@ fn key_down(key: VIRTUAL_KEY) -> bool {
 /// Disabled in the config, or Ctrl+Shift held to get Explorer's own menu.
 fn bypassed(config: &RwmConfig) -> bool {
     !config.enabled || (key_down(VK_CONTROL) && key_down(VK_SHIFT))
+}
+
+/// Submits a non-blocking out-of-process menu prebuild request to `rwm-host.exe` (zero UI block).
+/// Returns `true` when already cached/in-flight or queued cleanly in shared memory.
+fn dispatch_prefetch(selection: &SelectionKey) -> bool {
+    if selection.is_background()
+        || selection.item_count() == 0
+        || selection.item_count() > 16
+        || !selection.is_local_filesystem()
+    {
+        return false;
+    }
+    let clip_seq = clipboard_sequence_number();
+    let key_hash = selection.cache_key_hash(clip_seq);
+    let now_ms = now_tick_ms();
+    enum Outcome {
+        Unavailable,
+        AlreadyWarm,
+        Queued(HWND, u64),
+    }
+    let outcome = with_state(|state| {
+        let mut scratch = mem::take(&mut state.prefetch_scratch);
+        let result = match ensure_cache_client(state) {
+            None => Outcome::Unavailable,
+            Some(client) => {
+                if client.is_ready_or_in_flight(key_hash, now_ms) {
+                    Outcome::AlreadyWarm
+                } else if !selection.serialize_pidls(&mut scratch) {
+                    Outcome::Unavailable
+                } else if let Some(seq) = client.try_write_prefetch(
+                    key_hash,
+                    selection.shift_held(),
+                    clip_seq,
+                    &scratch,
+                ) {
+                    Outcome::Queued(HWND(client.host_hwnd() as *mut c_void), seq)
+                } else {
+                    Outcome::Unavailable
+                }
+            }
+        };
+        state.prefetch_scratch = scratch;
+        result
+    })
+    .unwrap_or(Outcome::Unavailable);
+
+    match outcome {
+        Outcome::AlreadyWarm => true,
+        Outcome::Queued(host_hwnd, seq) => unsafe {
+            PostMessageW(
+                host_hwnd,
+                prefetch_msg_id(),
+                WPARAM(seq as usize),
+                LPARAM(0),
+            )
+            .is_ok()
+        },
+        Outcome::Unavailable => false,
+    }
 }
 
 /// The hook sees the attach message before the window does, so the subclass is in place when
@@ -244,10 +347,12 @@ fn attach(defview: HWND) {
             if !state.views.iter().any(|view| view.defview == defview) {
                 state.seq = state.seq.wrapping_add(1).max(1);
                 let gen = state.seq;
-                let gesture = Gesture::Idle;
                 state.views.push(View {
                     defview,
-                    gesture,
+                    gesture: Gesture::Idle,
+                    hover: HoverTracker::default(),
+                    hover_timer: None,
+                    select_timer: None,
                     gen,
                 });
             }
@@ -283,28 +388,31 @@ fn detach(defview: HWND) {
 /// tracking, `WarmDllPin` release is deferred until that menu drops so no handler DLL unloads
 /// under a live menu interface.
 fn forget(defview: HWND, defer_warm: bool) {
-    let (view, warm, displaced_deferred) = with_state(|state| {
+    let (mut view, warm, displaced_deferred, drop_client) = with_state(|state| {
         state.deferred_detach.retain(|&hw| hw != defview);
         let index = state.views.iter().position(|view| view.defview == defview);
         let view = index.map(|index| state.views.swap_remove(index));
         if state.views.is_empty() {
             state.views = Vec::new();
         }
+        let drop_client = state.views.is_empty().then(|| state.cache_client.take()).flatten();
         let warm = state.views.is_empty().then(|| state.warm.take()).flatten();
         if defer_warm {
             if let Some(pin) = warm {
                 let old = state.deferred_warm.replace(pin);
-                return (view, None, old);
+                return (view, None, old, drop_client);
             }
-            return (view, None, None);
+            return (view, None, None, drop_client);
         }
-        (view, warm, None)
+        (view, warm, None, drop_client)
     })
     .unwrap_or_default();
-    if let Some(ref view) = view {
+    if let Some(ref mut view) = view {
         kill_gesture_timers(&view.gesture);
+        kill_view_speculative_timers(view);
     }
     drop(view);
+    drop(drop_client);
     drop(displaced_deferred);
     drop(warm);
 }
@@ -377,6 +485,8 @@ fn route(
         } else if with_view(defview, |view| {
             view.gesture.armed_timer().is_some_and(|(c, _)| c == window)
                 || view.gesture.ready_timer().is_some_and(|(c, _)| c == window)
+                || view.hover_timer.is_some_and(|(c, _)| c == window)
+                || view.select_timer.is_some_and(|(c, _)| c == window)
         }) == Some(true)
         {
             reset(defview);
@@ -407,6 +517,17 @@ fn route(
             }
             return Some(LRESULT(1));
         }
+        Some(Protocol::EditLabel) => {
+            if is_view {
+                let child = shell_view::view_children(defview)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(defview);
+                shell_view::trigger_inline_rename(defview, child);
+                return Some(LRESULT(1));
+            }
+            return Some(LRESULT(0));
+        }
         None => {}
     }
     match (is_view, msg) {
@@ -428,8 +549,24 @@ fn route(
             let at = gesture::point_from_lparam(lparam.0);
             if with_view(defview, |view| view.gesture.is_drag(at, drag)) == Some(true) {
                 reset(defview);
+                return None;
             }
+            on_mouse_move(window, defview, at);
             None
+        }
+        (false, WM_MOUSELEAVE) => {
+            cancel_speculative_timers(defview);
+            None
+        }
+        (false, WM_LBUTTONUP) => {
+            let result = unsafe { DefSubclassProc(window, msg, wparam, lparam) };
+            schedule_selection_prefetch(window, defview);
+            Some(result)
+        }
+        (false, WM_KEYUP) if is_selection_nav_key(wparam.0) => {
+            let result = unsafe { DefSubclassProc(window, msg, wparam, lparam) };
+            schedule_selection_prefetch(window, defview);
+            Some(result)
         }
         (false, WM_TIMER) if in_timer_band(wparam.0, ARM_TIMER_BASE) => {
             arm_timer_fired(window, defview, wparam.0);
@@ -441,12 +578,21 @@ fn route(
             drop(expired);
             Some(LRESULT(0))
         }
+        (false, WM_TIMER) if in_timer_band(wparam.0, HOVER_TIMER_BASE) => {
+            hover_timer_fired(window, defview, wparam.0);
+            Some(LRESULT(0))
+        }
+        (false, WM_TIMER) if in_timer_band(wparam.0, SELECT_TIMER_BASE) => {
+            select_timer_fired(window, defview, wparam.0);
+            Some(LRESULT(0))
+        }
         // Explorer releases capture on the button-up before WM_CONTEXTMENU, so this cancels
         // only a pending arm; a prebuilt menu stays for that message.
         (false, WM_CAPTURECHANGED | WM_CANCELMODE) => {
             if with_view(defview, |view| view.gesture.armed_timer().is_some()) == Some(true) {
-                reset(defview);
+                drop(swap_gesture(defview, Gesture::Idle));
             }
+            cancel_speculative_timers(defview);
             None
         }
         (false, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_KEYDOWN) => {
@@ -478,6 +624,167 @@ fn route(
     }
 }
 
+fn is_selection_nav_key(vk: usize) -> bool {
+    matches!(
+        vk as u16,
+        x if x == VK_UP.0
+            || x == VK_DOWN.0
+            || x == VK_LEFT.0
+            || x == VK_RIGHT.0
+            || x == VK_HOME.0
+            || x == VK_END.0
+            || x == VK_PRIOR.0
+            || x == VK_NEXT.0
+    )
+}
+
+fn on_mouse_move(child: HWND, defview: HWND, pt: POINT) {
+    if phase() != Phase::Idle || key_down(VK_RBUTTON) {
+        return;
+    }
+    let config = config();
+    if bypassed(&config) || !config.host_menu_cache || !config.hover_prebuild {
+        return;
+    }
+    let now_ms = now_tick_ms();
+    let arm_timer = with_view(defview, |view| {
+        if !view.hover.on_move(pt, now_ms, HOVER_DEADZONE_PX) {
+            return None;
+        }
+        let timer_id = timer_id_for(HOVER_TIMER_BASE, view.gen);
+        if let Some((old_child, old_id)) = view.hover_timer.replace((child, timer_id)) {
+            let _ = unsafe { KillTimer(old_child, old_id) };
+        }
+        Some(timer_id)
+    })
+    .flatten();
+    if let Some(timer_id) = arm_timer {
+        let delay = config.hover_delay_ms.clamp(40, 1000);
+        if unsafe { SetTimer(child, timer_id, delay, None) } == 0 {
+            with_view(defview, |view| {
+                view.hover_timer = None;
+                view.hover.timer_active = false;
+            });
+        }
+    }
+}
+
+fn hover_timer_fired(child: HWND, defview: HWND, timer_id: usize) {
+    let _ = unsafe { KillTimer(child, timer_id) };
+    let config = config();
+    if phase() != Phase::Idle
+        || key_down(VK_RBUTTON)
+        || bypassed(&config)
+        || !config.host_menu_cache
+        || !config.hover_prebuild
+    {
+        with_view(defview, |view| {
+            view.hover_timer = None;
+            view.hover.timer_active = false;
+        });
+        return;
+    }
+    let delay = config.hover_delay_ms.clamp(40, 1000);
+    let now_ms = now_tick_ms();
+    let action = with_view(defview, |view| {
+        if view.hover_timer != Some((child, timer_id)) {
+            return HoverAction::None;
+        }
+        let action = view.hover.on_timer(now_ms, delay, HOVER_DEADZONE_PX);
+        match action {
+            HoverAction::ReArm(_) => {}
+            HoverAction::Prefetch(pt) => {
+                view.hover_timer = None;
+                view.hover.mark_prefetched(pt);
+            }
+            HoverAction::None => {
+                view.hover_timer = None;
+            }
+        }
+        action
+    })
+    .unwrap_or(HoverAction::None);
+
+    match action {
+        HoverAction::ReArm(remaining) => {
+            if unsafe { SetTimer(child, timer_id, remaining, None) } == 0 {
+                with_view(defview, |view| {
+                    view.hover_timer = None;
+                    view.hover.timer_active = false;
+                });
+            }
+        }
+        HoverAction::Prefetch(pt) => {
+            if let (Some(screen), Some(kind)) = (
+                shell_view::client_to_screen(child, pt),
+                shell_view::child_kind(child),
+            ) {
+                if let Some(sel) =
+                    shell_view::selection_from_hover(defview, child, kind, screen, key_down(VK_SHIFT))
+                {
+                    dispatch_prefetch(&sel);
+                }
+            }
+        }
+        HoverAction::None => {}
+    }
+}
+
+fn schedule_selection_prefetch(child: HWND, defview: HWND) {
+    if phase() != Phase::Idle {
+        return;
+    }
+    let config = config();
+    if bypassed(&config) || !config.host_menu_cache || !config.selection_prebuild {
+        return;
+    }
+    let arm = with_view(defview, |view| {
+        let timer_id = timer_id_for(SELECT_TIMER_BASE, view.gen);
+        let prev = view.select_timer.replace((child, timer_id));
+        if let Some((old_child, old_id)) = prev {
+            let _ = unsafe { KillTimer(old_child, old_id) };
+        }
+        timer_id
+    });
+    if let Some(timer_id) = arm {
+        if unsafe { SetTimer(child, timer_id, SELECT_DWELL_MS, None) } == 0 {
+            with_view(defview, |view| view.select_timer = None);
+        }
+    }
+}
+
+fn select_timer_fired(child: HWND, defview: HWND, timer_id: usize) {
+    let _ = unsafe { KillTimer(child, timer_id) };
+    let valid = with_view(defview, |view| {
+        if view.select_timer == Some((child, timer_id)) {
+            view.select_timer = None;
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false);
+    if !valid || phase() != Phase::Idle || key_down(VK_RBUTTON) {
+        return;
+    }
+    let config = config();
+    if bypassed(&config) || !config.host_menu_cache || !config.selection_prebuild {
+        return;
+    }
+    if let Some(view) = ShellView::find(defview) {
+        if view.selection_count() > 0 {
+            if let Ok(sel) = SelectionKey::capture_from_view(
+                &view.view,
+                view.folder_view.as_ref(),
+                false,
+                key_down(VK_SHIFT),
+            ) {
+                dispatch_prefetch(&sel);
+            }
+        }
+    }
+}
+
 fn right_button_down(
     child: HWND,
     defview: HWND,
@@ -485,6 +792,7 @@ fn right_button_down(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    cancel_speculative_timers(defview);
     let stale = swap_gesture(defview, Gesture::Idle);
     // Explorer moves the selection and focus on the press itself, so it goes first.
     let result = unsafe { DefSubclassProc(child, msg, wparam, lparam) };
@@ -493,38 +801,67 @@ fn right_button_down(
         let config = config();
         // The desktop list view tracks the press in a modal loop, so the button can already be
         // up, and the menu already shown, when default processing returns.
-        let arm = config.prebuild_on_rbuttondown && !bypassed(&config) && key_down(VK_RBUTTON);
-        if arm && phase() == Phase::Idle {
+        let active = config.prebuild_on_rbuttondown && !bypassed(&config) && key_down(VK_RBUTTON);
+        if active && phase() == Phase::Idle {
             let down = gesture::point_from_lparam(lparam.0);
-            let armed_timer = with_state(|state| {
-                state.seq = state.seq.wrapping_add(1).max(1);
-                let gen = state.seq;
-                let timer_id = timer_id_for(ARM_TIMER_BASE, gen);
-                let old = state
-                    .views
-                    .iter_mut()
-                    .find(|view| view.defview == defview)
-                    .map(|view| {
-                        view.gen = gen;
-                        mem::replace(
-                            &mut view.gesture,
-                            Gesture::Armed {
-                                child,
-                                down,
-                                timer_id,
-                                gen,
-                            },
-                        )
-                    });
-                old.map(|old| (old, timer_id))
-            })
-            .flatten();
-            if let Some((old, timer_id)) = armed_timer {
-                kill_gesture_timers(&old);
-                drop(old);
-                let delay = config.arm_delay_ms.clamp(1, 100);
-                if unsafe { SetTimer(child, timer_id, delay, None) } == 0 {
-                    reset(defview);
+            let mut host_screen = None;
+            if config.host_menu_cache {
+                if let (Some(screen), Some(kind)) = (
+                    shell_view::client_to_screen(child, down),
+                    shell_view::child_kind(child),
+                ) {
+                    if shell_view::hit_test(child, kind, screen) == Some(Hit::Item) {
+                        if let Some(view) = ShellView::find(defview) {
+                            if let Ok(sel) = SelectionKey::capture_from_view(
+                                &view.view,
+                                view.folder_view.as_ref(),
+                                false,
+                                key_down(VK_SHIFT),
+                            ) {
+                                if dispatch_prefetch(&sel) {
+                                    host_screen = Some(screen);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(down_screen) = host_screen {
+                drop(swap_gesture(
+                    defview,
+                    Gesture::HostPrefetched { down, down_screen },
+                ));
+            } else {
+                let armed_timer = with_state(|state| {
+                    state.seq = state.seq.wrapping_add(1).max(1);
+                    let gen = state.seq;
+                    let timer_id = timer_id_for(ARM_TIMER_BASE, gen);
+                    let old = state
+                        .views
+                        .iter_mut()
+                        .find(|view| view.defview == defview)
+                        .map(|view| {
+                            view.gen = gen;
+                            mem::replace(
+                                &mut view.gesture,
+                                Gesture::Armed {
+                                    child,
+                                    down,
+                                    timer_id,
+                                    gen,
+                                },
+                            )
+                        });
+                    old.map(|old| (old, timer_id))
+                })
+                .flatten();
+                if let Some((old, timer_id)) = armed_timer {
+                    kill_gesture_timers(&old);
+                    drop(old);
+                    let delay = config.arm_delay_ms.clamp(1, 100);
+                    if unsafe { SetTimer(child, timer_id, delay, None) } == 0 {
+                        reset(defview);
+                    }
                 }
             }
         }
@@ -567,6 +904,8 @@ fn arm_timer_fired(child: HWND, defview: HWND, timer_id: usize) -> Option<()> {
             view.gesture = Gesture::Ready {
                 child,
                 down,
+                down_screen: screen,
+                background,
                 menu,
                 built_at: Instant::now(),
                 timer_id: ready_timer_id,
@@ -591,11 +930,12 @@ fn build_menu_in_phase(
     shift: bool,
     config: &RwmConfig,
 ) -> Option<NativeMenu> {
-    // Paints the new selection before Shell extensions block this thread.
-    let _ = unsafe { RedrawWindow(source, None, None, RDW_UPDATENOW) };
-    let before = config
-        .pin_handler_dlls
-        .then(WarmDllPin::snapshot_loaded_modules);
+    // Flushes any invalidated selection region without forcing synchronous repaint when clean.
+    let _ = unsafe { UpdateWindow(source) };
+    let need_pin = config.pin_handler_dlls
+        && with_state(|state| state.warm.as_ref().is_none_or(WarmDllPin::should_snapshot))
+            == Some(true);
+    let before = need_pin.then(WarmDllPin::snapshot_loaded_modules);
     let menu =
         NativeMenu::build_from_view(&view.view, view.folder_view.as_ref(), background, shift);
     let menu = menu.ok()?;
@@ -610,75 +950,167 @@ fn build_menu_in_phase(
     Some(menu)
 }
 
+fn try_claim_host_show(
+    defview: HWND,
+    key: &SelectionKey,
+    anchor: POINT,
+    no_animation: bool,
+) -> bool {
+    if key.is_background() || !key.is_local_filesystem() {
+        return false;
+    }
+    let clip_seq = clipboard_sequence_number();
+    let key_hash = key.cache_key_hash(clip_seq);
+    let now_ms = now_tick_ms();
+    let explorer_root = shell_view::root_window(defview);
+    let prepared = with_state(|state| {
+        let client = ensure_cache_client(state)?;
+        if !client.is_ready_or_in_flight(key_hash, now_ms) {
+            return None;
+        }
+        let host_pid = client.host_pid();
+        let host_hwnd = HWND(client.host_hwnd() as *mut c_void);
+        let req = ShowRequest {
+            request_seq: 0,
+            key_hash,
+            clipboard_seq: clip_seq,
+            anchor_x: anchor.x,
+            anchor_y: anchor.y,
+            defview_hwnd: defview.0 as isize,
+            explorer_root_hwnd: explorer_root.0 as isize,
+            no_animation,
+        };
+        let seq = client.try_write_show(&req)?;
+        Some((host_pid, host_hwnd, seq))
+    })
+    .flatten();
+
+    let Some((host_pid, host_hwnd, seq)) = prepared else {
+        return false;
+    };
+    let _ = unsafe { AllowSetForegroundWindow(host_pid) };
+    let mut reply = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            host_hwnd,
+            claim_show_msg_id(),
+            WPARAM(seq as usize),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            CLAIM_SHOW_TIMEOUT_MS,
+            Some(&mut reply),
+        )
+    };
+    sent.0 != 0 && reply == 1
+}
+
+enum ContextDecision {
+    Fallback,
+    HandledByHost,
+    ShowLocal(NativeMenu, POINT),
+}
+
 /// Shows the native menu for one `WM_CONTEXTMENU`. `None` leaves the message to Explorer.
 fn context_menu(defview: HWND, source: HWND, lparam: LPARAM) -> Option<LRESULT> {
-    let prebuilt = swap_gesture(defview, Gesture::Idle).into_fresh_menu(Instant::now());
+    cancel_speculative_timers(defview);
+    let (prebuilt, hit_cache) =
+        swap_gesture(defview, Gesture::Idle).take_for_context_menu(Instant::now());
     let config = config();
     if bypassed(&config) {
         return None;
     }
     let point = gesture::context_menu_point(lparam.0);
     let kind = shell_view::child_kind(source);
-    let prepared = (|| -> Option<(NativeMenu, windows::Win32::Foundation::POINT)> {
-        let building = PhaseGuard::enter(Phase::Building)?;
+    let decision = (|| -> ContextDecision {
+        let Some(building) = PhaseGuard::enter(Phase::Building) else {
+            return ContextDecision::Fallback;
+        };
+        let drag = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
         let hit = match (point, kind) {
-            (Some(point), Some(kind)) if shell_view::in_client_area(source, point) => {
-                // Fail open to Explorer when a mouse hit inside client area cannot be resolved.
-                Some(shell_view::hit_test(source, kind, point)?)
+            (Some(pt), Some(kind)) => {
+                if let Some((_down_screen, bg)) =
+                    hit_cache.filter(|(down, _)| gesture::within_drag_rect(pt, *down, drag))
+                {
+                    Some(if bg { Hit::Background } else { Hit::Item })
+                } else if shell_view::in_client_area(source, pt) {
+                    // Fail open to Explorer when a mouse hit inside client area cannot be resolved.
+                    match shell_view::hit_test(source, kind, pt) {
+                        Some(hit) => Some(hit),
+                        None => return ContextDecision::Fallback,
+                    }
+                } else {
+                    return ContextDecision::Fallback;
+                }
             }
-            (Some(_), Some(_)) => return None,
             _ => None,
         };
         if hit == Some(Hit::Other) {
-            return None;
+            return ContextDecision::Fallback;
         }
-        let view = ShellView::find(defview)?;
+        let Some(view) = ShellView::find(defview) else {
+            return ContextDecision::Fallback;
+        };
         // Explorer has applied the click by now, so an empty selection means the background.
         let background = hit == Some(Hit::Background) || view.selection_count() == 0;
         let shift = key_down(VK_SHIFT);
-        let key = SelectionKey::capture_from_view(
+        let Ok(key) = SelectionKey::capture_from_view(
             &view.view,
             view.folder_view.as_ref(),
             background,
             shift,
-        )
-        .ok()?;
-        let menu = match prebuilt.filter(|menu| menu.selection().matches(&key)) {
-            Some(menu) => menu,
-            None => build_menu_in_phase(source, &view, background, shift, &config)?,
+        ) else {
+            return ContextDecision::Fallback;
         };
+        let anchor = point.unwrap_or_else(|| {
+            let focus = kind.and_then(|kind| shell_view::focused_item_center(source, kind));
+            gesture::keyboard_anchor(focus, shell_view::window_rect(defview))
+        });
+
         let still_attached = with_state(|state| {
             !state.deferred_detach.contains(&defview)
                 && state.views.iter().any(|v| v.defview == defview)
         })
         .unwrap_or(false);
         if !still_attached {
-            return None;
+            return ContextDecision::Fallback;
         }
-        let anchor = point.unwrap_or_else(|| {
-            let focus = kind.and_then(|kind| shell_view::focused_item_center(source, kind));
-            gesture::keyboard_anchor(focus, shell_view::window_rect(defview))
-        });
+
+        if config.host_menu_cache
+            && try_claim_host_show(defview, &key, anchor, config.no_animation)
+        {
+            drop(building);
+            return ContextDecision::HandledByHost;
+        }
+
+        let menu = match prebuilt.filter(|menu| menu.selection().matches(&key)) {
+            Some(menu) => menu,
+            None => match build_menu_in_phase(source, &view, background, shift, &config) {
+                Some(menu) => menu,
+                None => return ContextDecision::Fallback,
+            },
+        };
         drop(building);
-        Some((menu, anchor))
+        ContextDecision::ShowLocal(menu, anchor)
     })();
 
-    let outcome = if let Some((menu, anchor)) = prepared {
-        let tracking = PhaseGuard::tracking(defview, &menu);
-        let result = tracking.map(|_tracking| {
-            menu.track_and_invoke(defview, (anchor.x, anchor.y), config.no_animation)
-        });
-        drop(menu);
-        match result {
-            Some(Err(ShellError::Windows(_))) | None => None,
-            Some(Err(error)) => {
-                tracing::debug!(%error, "the chosen menu command failed");
-                Some(LRESULT(0))
+    let outcome = match decision {
+        ContextDecision::Fallback => None,
+        ContextDecision::HandledByHost => Some(LRESULT(0)),
+        ContextDecision::ShowLocal(menu, anchor) => {
+            let tracking = PhaseGuard::tracking(defview, &menu);
+            let result = tracking.map(|_tracking| {
+                menu.track_and_invoke(defview, (anchor.x, anchor.y), config.no_animation)
+            });
+            drop(menu);
+            match result {
+                Some(Err(ShellError::Windows(_))) | None => None,
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "the chosen menu command failed");
+                    Some(LRESULT(0))
+                }
+                Some(Ok(_)) => Some(LRESULT(0)),
             }
-            Some(Ok(_)) => Some(LRESULT(0)),
         }
-    } else {
-        None
     };
     drain_deferred_cleanup();
     outcome

@@ -5,7 +5,7 @@ members = ["crates/rwm-core", "crates/rwm-hook", "crates/rwm-cli"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.2.0"
+version = "0.3.0"
 repository = "https://github.com/yebisu0529-ship-it/RustWindowsMenu"
 description = "Ultra-fast Windows 11 classic-style right-click menu accelerator in Rust"
 
@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 opt-level = 3
-strip = "symbols"
+strip = true

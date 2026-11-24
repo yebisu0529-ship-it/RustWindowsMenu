@@ -5,6 +5,7 @@ mod doctor;
 mod handlers;
 mod inspect;
 mod install;
+mod optimize;
 mod preview;
 mod status;
 
@@ -24,6 +25,7 @@ pub fn dispatch(command: Command) -> CliResult<ExitCode> {
         Command::Doctor(args) => doctor::run(&args),
         Command::Bench(args) => bench::run(&args),
         Command::Inspect(args) => inspect::run(&args),
+        Command::Optimize(args) => optimize::run(&args),
         Command::Preview(args) => preview::run(&args),
         Command::Handlers { action } => handlers::run(action),
         Command::Classic { action } => classic::run(action),

@@ -1,4 +1,4 @@
-# RustWindowsMenu v0.2.0 configuration
+# RustWindowsMenu v0.3.0 configuration
 # Copy to %APPDATA%\RustWindowsMenu\config.toml or run `rwm config init`.
 # Emergency kill switch: create an empty file at %LOCALAPPDATA%\RustWindowsMenu\DISABLE_HOOK.
 
@@ -8,13 +8,13 @@ enabled = true
 # Build the native menu as soon as the right mouse button is pressed.
 prebuild_on_rbuttondown = true
 
-# Delay before arming the accelerator, in milliseconds (1-100; Windows SetTimer floor is ~10-15 ms).
+# Delay before arming the in-process fallback prebuilder, in milliseconds (1-100).
 arm_delay_ms = 15
 
-# Disable popup animation for the most immediate visual response.
+# Disable popup animation for instant visual presentation.
 no_animation = true
 
-# Keep handler DLLs pinned inside explorer.exe until all attached views detach.
+# Keep handler DLLs pinned inside explorer.exe and rwm-host.exe to avoid reload jitter.
 pin_handler_dlls = true
 
 # Maximum number of pinned handler DLLs (0-128).
@@ -25,3 +25,21 @@ classic_menu_fallback = false
 
 # Write debug diagnostic logs when RWM_LOG is not explicitly set.
 debug_logging = false
+
+# Speculatively prebuild the next menu off Explorer's UI thread while hovering an item.
+hover_prebuild = true
+
+# Hover dwell time before speculative prefetch starts, in milliseconds (40-1000).
+hover_delay_ms = 120
+
+# Speculatively prebuild off-thread when keyboard or left-click selection changes.
+selection_prebuild = true
+
+# Enable out-of-process prebuilt menu cache inside rwm-host.exe for 1-5 ms right-click hits.
+host_menu_cache = true
+
+# Number of prebuilt local filesystem menus retained in rwm-host LRU cache (1-16).
+host_cache_entries = 6
+
+# Cache entry lifetime in milliseconds before invalidation (1000-30000).
+host_cache_ttl_ms = 8000

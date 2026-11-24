@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{
@@ -12,11 +12,16 @@ use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows_core::PCWSTR;
 
-pub struct ModuleSnapshot(Option<HashSet<usize>>);
+use crate::fasthash::FastSet;
+
+pub struct ModuleSnapshot(Option<FastSet<usize>>);
 
 pub struct WarmDllPin {
     pinned: Vec<(HMODULE, PathBuf)>,
     max_pinned: usize,
+    handles: Vec<HMODULE>,
+    after_scratch: FastSet<usize>,
+    last_needed_bytes: u32,
 }
 
 impl WarmDllPin {
@@ -24,30 +29,71 @@ impl WarmDllPin {
         Self {
             pinned: Vec::new(),
             max_pinned: max_pinned.min(128),
+            handles: vec![HMODULE::default(); 256],
+            after_scratch: FastSet::default(),
+            last_needed_bytes: 0,
         }
     }
 
+    #[inline]
+    pub fn should_snapshot(&self) -> bool {
+        self.pinned.len() < self.max_pinned
+    }
+
+    #[inline]
+    pub fn max_pinned(&self) -> usize {
+        self.max_pinned
+    }
+
+    #[inline]
+    pub fn last_needed_bytes(&self) -> u32 {
+        self.last_needed_bytes
+    }
+
+    /// 1-syscall check returning the byte size required to enumerate all currently loaded modules.
+    pub fn probe_module_bytes(&self) -> Option<u32> {
+        let mut probe = HMODULE::default();
+        let mut needed = 0u32;
+        let ok = unsafe {
+            K32EnumProcessModules(
+                GetCurrentProcess(),
+                &mut probe,
+                size_of::<HMODULE>() as u32,
+                &mut needed,
+            )
+        };
+        ok.as_bool().then_some(needed)
+    }
+
     pub fn snapshot_loaded_modules() -> ModuleSnapshot {
-        snapshot_loaded_modules()
+        let mut handles = vec![HMODULE::default(); 256];
+        let mut set = FastSet::default();
+        if fill_module_set(&mut handles, &mut set).is_some() {
+            ModuleSnapshot(Some(set))
+        } else {
+            ModuleSnapshot(None)
+        }
     }
 
     pub fn pin_newly_loaded(&mut self, before: &ModuleSnapshot) -> usize {
         let Some(before) = &before.0 else { return 0 };
-        if self.pinned.len() >= self.max_pinned {
+        if !self.should_snapshot() {
             return 0;
         }
         let Some(windows) = system_windows_dir() else {
             return 0;
         };
-        let Some(after) = snapshot_loaded_modules().0 else {
+        let Some(needed) = fill_module_set(&mut self.handles, &mut self.after_scratch) else {
             return 0;
         };
+        self.last_needed_bytes = needed;
         let original_count = self.pinned.len();
-        let mut candidates: Vec<_> = after
+        let mut candidates: Vec<_> = self
+            .after_scratch
             .difference(before)
             .filter_map(|&base| {
                 let path = module_path(HMODULE(base as *mut _))?;
-                (!is_core_system_module(&path, &windows)
+                (!is_core_system_module(&path, windows)
                     && path
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
@@ -56,7 +102,7 @@ impl WarmDllPin {
             .collect();
         candidates.sort_by(|a, b| a.1.cmp(&b.1));
         for (base, path) in candidates {
-            if self.pinned.len() >= self.max_pinned {
+            if !self.should_snapshot() {
                 break;
             }
             if self
@@ -105,34 +151,34 @@ impl Drop for WarmDllPin {
     }
 }
 
-pub fn snapshot_loaded_modules() -> ModuleSnapshot {
-    let mut handles = vec![HMODULE::default(); 256];
+fn fill_module_set(handles: &mut Vec<HMODULE>, out: &mut FastSet<usize>) -> Option<u32> {
+    if handles.is_empty() {
+        handles.resize(256, HMODULE::default());
+    }
     loop {
         let bytes = std::mem::size_of_val(handles.as_slice()) as u32;
         let mut needed = 0;
         let success = unsafe {
-            K32EnumProcessModules(
-                GetCurrentProcess(),
-                handles.as_mut_ptr(),
-                bytes,
-                &mut needed,
-            )
+            K32EnumProcessModules(GetCurrentProcess(), handles.as_mut_ptr(), bytes, &mut needed)
         };
         if !success.as_bool() {
-            return ModuleSnapshot(None);
+            return None;
         }
         let count = needed as usize / size_of::<HMODULE>();
         if needed <= bytes {
-            handles.truncate(count);
-            return ModuleSnapshot(Some(
-                handles
-                    .into_iter()
-                    .map(|module| module.0 as usize)
-                    .collect(),
-            ));
+            out.clear();
+            out.reserve(count);
+            for &module in &handles[..count] {
+                out.insert(module.0 as usize);
+            }
+            return Some(needed);
         }
         handles.resize(count + 32, HMODULE::default());
     }
+}
+
+pub fn snapshot_loaded_modules() -> ModuleSnapshot {
+    WarmDllPin::snapshot_loaded_modules()
 }
 
 fn module_path(module: HMODULE) -> Option<PathBuf> {
@@ -149,10 +195,21 @@ fn module_path(module: HMODULE) -> Option<PathBuf> {
     }
 }
 
-fn system_windows_dir() -> Option<PathBuf> {
-    let mut buffer = [0; 260];
-    let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
-    (len > 0 && len < buffer.len()).then(|| PathBuf::from(OsString::from_wide(&buffer[..len])))
+fn system_windows_dir() -> Option<&'static Path> {
+    static WINDOWS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    WINDOWS_DIR
+        .get_or_init(|| {
+            let mut buffer = [0; 260];
+            let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+            (len > 0 && len < buffer.len())
+                .then(|| PathBuf::from(OsString::from_wide(&buffer[..len])))
+        })
+        .as_deref()
+}
+
+/// Returns `true` when `path` resides under `<Windows>\System32`, `SysWOW64`, or `WinSxS`.
+pub fn is_system_module(path: &Path) -> bool {
+    system_windows_dir().is_some_and(|windows| is_core_system_module(path, windows))
 }
 
 fn is_core_system_module(path: &Path, windows: &Path) -> bool {
@@ -178,9 +235,14 @@ mod tests {
         let snapshot = snapshot_loaded_modules();
         assert!(!snapshot.0.as_ref().unwrap().is_empty());
         let mut pool = WarmDllPin::new(0);
+        assert!(!pool.should_snapshot());
         assert_eq!(pool.pin_newly_loaded(&snapshot), 0);
         pool.release_all();
         assert!(pool.pinned.is_empty());
+
+        let warm = WarmDllPin::new(4);
+        assert!(warm.should_snapshot());
+        assert!(warm.probe_module_bytes().unwrap_or(0) > 0);
     }
 
     #[test]

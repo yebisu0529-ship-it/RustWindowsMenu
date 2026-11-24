@@ -63,6 +63,7 @@ impl Breaker {
 pub(crate) enum Protocol {
     Attach,
     Detach,
+    EditLabel,
 }
 
 /// Ordinary traffic is below the registered-message range and returns at the first compare.
@@ -73,6 +74,8 @@ pub(crate) fn protocol_message(msg: u32) -> Option<Protocol> {
         Some(Protocol::Attach)
     } else if msg == detach_id() || msg == any_build_detach_id() {
         Some(Protocol::Detach)
+    } else if msg == rwm_core::ipc_cache::edit_label_msg_id() {
+        Some(Protocol::EditLabel)
     } else {
         None
     }
@@ -245,7 +248,7 @@ mod tests {
             BUILD_ID.as_bytes()
         );
         assert_eq!(unsafe { rwm_build_id(std::ptr::null_mut()) }, id);
-        assert_eq!(rwm_abi_version(), 2);
+        assert_eq!(rwm_abi_version(), 3);
         let (attach, detach) = (rwm_attach_message_id(), rwm_detach_message_id());
         assert_eq!(
             attach,
@@ -260,6 +263,10 @@ mod tests {
         assert_eq!(protocol_message(detach), Some(Protocol::Detach));
         let any_build = register("RustWindowsMenu.DetachHook");
         assert_eq!(protocol_message(any_build), Some(Protocol::Detach));
+        assert_eq!(
+            protocol_message(rwm_core::ipc_cache::edit_label_msg_id()),
+            Some(Protocol::EditLabel)
+        );
         assert_eq!(
             protocol_message(register("RustWindowsMenu.Unrelated")),
             None

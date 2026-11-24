@@ -1,21 +1,25 @@
 use std::ffi::OsString;
+use std::hash::Hasher;
 use std::io;
 use std::marker::PhantomData;
 use std::os::windows::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, Prefix};
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
     FreeLibrary, GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_MENU_HANDLE, ERROR_INVALID_WINDOW_HANDLE, ERROR_POPUP_ALREADY_ACTIVE, HWND,
-    LPARAM, LRESULT, NO_ERROR, POINT, WPARAM,
+    ERROR_INVALID_MENU_HANDLE, ERROR_INVALID_WINDOW_HANDLE, ERROR_POPUP_ALREADY_ACTIVE,
+    E_OUTOFMEMORY, HWND, LPARAM, LRESULT, NO_ERROR, POINT, WPARAM,
 };
 use windows::Win32::Globalization::{GetUserDefaultUILanguage, MultiByteToWideChar, CP_ACP};
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+    CoInitializeEx, CoTaskMemAlloc, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -24,9 +28,9 @@ use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IContextMenu, IContextMenu2, IContextMenu3, IFolderView, IFolderView2, ILClone, ILFindLastID,
-    ILIsEqual, ILIsParent, ILRemoveLastID, IPersistFolder2, IShellFolder, IShellItem,
-    IShellItemArray, IShellView, SHBindToObject, SHBindToParent, SHGetDesktopFolder,
+    IContextMenu, IContextMenu2, IContextMenu3, IFolderView, IFolderView2, ILClone, ILCombine,
+    ILFindLastID, ILGetSize, ILIsEqual, ILIsParent, ILRemoveLastID, IPersistFolder2, IShellFolder,
+    IShellItem, IShellItemArray, IShellView, SHBindToObject, SHBindToParent, SHGetDesktopFolder,
     SHGetIDListFromObject, SHGetNameFromIDList, SHParseDisplayName, CMF_CANRENAME, CMF_EXPLORE,
     CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
     GCS_VERBA, GCS_VERBW, SEE_MASK_ASYNCOK, SEE_MASK_UNICODE, SIGDN_FILESYSPATH, SVGIO_BACKGROUND,
@@ -42,7 +46,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{w, Interface, PCSTR, PCWSTR, PSTR, PWSTR};
 
+use crate::fasthash::FastHasher;
+use crate::ipc_cache::MAX_PREFETCH_BYTES;
 use crate::reg_util::{pwstr_to_string, wide_null};
+
+const MAX_PREFETCH_ITEMS: usize = 16;
+const DRIVE_REMOTE_TYPE: u32 = 4;
 
 const FIRST_ID: u32 = 1;
 const LAST_ID: u32 = 0x7FFF;
@@ -114,6 +123,71 @@ impl OwnedPidl {
 
     pub fn is_null(&self) -> bool {
         self.0.is_null()
+    }
+
+    /// Raw serialized bytes of this PIDL including its trailing 2-byte zero terminator.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.0.is_null() {
+            return &[];
+        }
+        let size = unsafe { ILGetSize(Some(self.0)) } as usize;
+        if size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.0.cast::<u8>(), size) }
+        }
+    }
+
+    /// Validates a serialized PIDL buffer and copies it into a Shell-owned `CoTaskMemAlloc` block.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ShellError> {
+        let mut offset = 0usize;
+        while offset + 2 <= bytes.len() {
+            let cb = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            if cb == 0 {
+                let total = offset + 2;
+                if total != bytes.len() {
+                    return Err(ShellError::InvalidTarget);
+                }
+                let raw = unsafe { CoTaskMemAlloc(total) }.cast::<u8>();
+                if raw.is_null() {
+                    return Err(windows_core::Error::from(E_OUTOFMEMORY).into());
+                }
+                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), raw, total) };
+                return Ok(unsafe { Self::from_raw_owned(raw.cast()) });
+            }
+            if cb < 3 || offset + cb > bytes.len() {
+                return Err(ShellError::InvalidTarget);
+            }
+            offset += cb;
+        }
+        Err(ShellError::InvalidTarget)
+    }
+
+    /// Combines a parent absolute PIDL with a relative child PIDL into a newly owned absolute PIDL.
+    ///
+    /// # Safety
+    ///
+    /// `relative_child` must be a valid Shell PIDL pointer.
+    pub unsafe fn combine_child_raw(
+        &self,
+        relative_child: *const ITEMIDLIST,
+    ) -> Result<Self, ShellError> {
+        if self.0.is_null() || relative_child.is_null() {
+            return Err(ShellError::InvalidTarget);
+        }
+        let combined = unsafe { ILCombine(Some(self.0), Some(relative_child)) };
+        Self::checked(combined)
+    }
+
+    /// Compares raw PIDL bytes first (`~2 ns`) and falls back to `ILIsEqual` only on mismatch.
+    #[inline]
+    pub fn fast_equals(&self, other: &Self) -> bool {
+        let (a, b) = (self.as_bytes(), other.as_bytes());
+        if !a.is_empty() && a == b {
+            return true;
+        }
+        unsafe { ILIsEqual(self.0, other.0).as_bool() }
     }
 
     fn fs_path(&self) -> Option<PathBuf> {
@@ -203,26 +277,19 @@ pub struct SelectionKey {
     folder_pidl: OwnedPidl,
     item_pidls: Vec<OwnedPidl>,
     shift_held: bool,
-    folder_fs_path: Option<PathBuf>,
-    primary_fs_path: Option<PathBuf>,
+    folder_fs_path: OnceLock<Option<PathBuf>>,
+    primary_fs_path: OnceLock<Option<PathBuf>>,
 }
 
 impl SelectionKey {
-    fn new(folder_pidl: OwnedPidl, item_pidls: Vec<OwnedPidl>, shift_held: bool) -> Self {
-        let is_background = item_pidls.is_empty();
-        let folder_fs_path = folder_pidl.fs_path();
-        let primary_fs_path = if is_background {
-            folder_fs_path.clone()
-        } else {
-            item_pidls[0].fs_path()
-        };
+    pub fn new(folder_pidl: OwnedPidl, item_pidls: Vec<OwnedPidl>, shift_held: bool) -> Self {
         Self {
-            is_background,
+            is_background: item_pidls.is_empty(),
             folder_pidl,
             item_pidls,
             shift_held,
-            folder_fs_path,
-            primary_fs_path,
+            folder_fs_path: OnceLock::new(),
+            primary_fs_path: OnceLock::new(),
         }
     }
 
@@ -239,27 +306,143 @@ impl SelectionKey {
     }
 
     pub fn folder_fs_path(&self) -> Option<&Path> {
-        self.folder_fs_path.as_deref()
+        self.folder_fs_path
+            .get_or_init(|| self.folder_pidl.fs_path())
+            .as_deref()
     }
 
     pub fn primary_fs_path(&self) -> Option<&Path> {
-        self.primary_fs_path.as_deref()
+        self.primary_fs_path
+            .get_or_init(|| {
+                if self.is_background {
+                    self.folder_fs_path().map(Path::to_path_buf)
+                } else {
+                    self.item_pidls[0].fs_path()
+                }
+            })
+            .as_deref()
     }
 
     pub fn matches(&self, other: &Self) -> bool {
-        let equal = |a: &OwnedPidl, b: &OwnedPidl| unsafe { ILIsEqual(a.0, b.0).as_bool() };
         self.is_background == other.is_background
             && self.shift_held == other.shift_held
             && self.item_pidls.len() == other.item_pidls.len()
-            && equal(&self.folder_pidl, &other.folder_pidl)
+            && self.folder_pidl.fast_equals(&other.folder_pidl)
             && self
                 .item_pidls
                 .iter()
                 .zip(&other.item_pidls)
-                .all(|(a, b)| equal(a, b))
+                .all(|(a, b)| a.fast_equals(b))
     }
 
-    pub(crate) fn from_paths(
+    /// Computes a zero-allocation 64-bit cache key from PIDL bytes, flags, and clipboard sequence.
+    pub fn cache_key_hash(&self, clipboard_seq: u32) -> u64 {
+        let mut hasher = FastHasher::default();
+        hasher.write_u8(u8::from(self.is_background));
+        hasher.write_u8(u8::from(self.shift_held));
+        hasher.write_u32(clipboard_seq);
+        hasher.write_usize(self.item_pidls.len());
+        let folder = self.folder_pidl.as_bytes();
+        hasher.write_usize(folder.len());
+        hasher.write(folder);
+        for item in &self.item_pidls {
+            let bytes = item.as_bytes();
+            hasher.write_usize(bytes.len());
+            hasher.write(bytes);
+        }
+        hasher.finish()
+    }
+
+    /// Serializes folder + item PIDLs into a caller-owned scratch buffer (`<= 16` items, `<= 16 KB`).
+    pub fn serialize_pidls(&self, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        if self.item_pidls.len() > MAX_PREFETCH_ITEMS {
+            return false;
+        }
+        let folder = self.folder_pidl.as_bytes();
+        if folder.is_empty() {
+            return false;
+        }
+        out.extend_from_slice(&(self.item_pidls.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(folder.len() as u32).to_le_bytes());
+        out.extend_from_slice(folder);
+        for item in &self.item_pidls {
+            let bytes = item.as_bytes();
+            if bytes.is_empty() || out.len() + 4 + bytes.len() > MAX_PREFETCH_BYTES {
+                out.clear();
+                return false;
+            }
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out.len() <= MAX_PREFETCH_BYTES
+    }
+
+    /// Reconstructs and validates a [`SelectionKey`] from serialized PIDL bytes.
+    pub fn from_serialized_pidls(bytes: &[u8], shift_held: bool) -> Result<Self, ShellError> {
+        if bytes.len() > MAX_PREFETCH_BYTES || bytes.len() < 8 {
+            return Err(ShellError::InvalidTarget);
+        }
+        let read_u32 = |offset: &mut usize| -> Result<usize, ShellError> {
+            let end = offset.checked_add(4).ok_or(ShellError::InvalidTarget)?;
+            let slice = bytes.get(*offset..end).ok_or(ShellError::InvalidTarget)?;
+            *offset = end;
+            Ok(u32::from_le_bytes(slice.try_into().unwrap()) as usize)
+        };
+        let mut cursor = 0usize;
+        let count = read_u32(&mut cursor)?;
+        if count > MAX_PREFETCH_ITEMS {
+            return Err(ShellError::InvalidTarget);
+        }
+        let folder_len = read_u32(&mut cursor)?;
+        let folder_end = cursor
+            .checked_add(folder_len)
+            .ok_or(ShellError::InvalidTarget)?;
+        let folder_bytes = bytes
+            .get(cursor..folder_end)
+            .ok_or(ShellError::InvalidTarget)?;
+        cursor = folder_end;
+        let folder = OwnedPidl::from_bytes(folder_bytes)?;
+
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let item_len = read_u32(&mut cursor)?;
+            let item_end = cursor
+                .checked_add(item_len)
+                .ok_or(ShellError::InvalidTarget)?;
+            let item_bytes = bytes
+                .get(cursor..item_end)
+                .ok_or(ShellError::InvalidTarget)?;
+            cursor = item_end;
+            let item = OwnedPidl::from_bytes(item_bytes)?;
+            if !unsafe { ILIsParent(folder.0, item.0, true).as_bool() } {
+                return Err(ShellError::InvalidTarget);
+            }
+            items.push(item);
+        }
+        if cursor != bytes.len() {
+            return Err(ShellError::InvalidTarget);
+        }
+        Ok(Self::new(folder, items, shift_held))
+    }
+
+    /// True when the primary target maps to a non-network local filesystem drive path.
+    pub fn is_local_filesystem(&self) -> bool {
+        let Some(path) = self.primary_fs_path() else {
+            return false;
+        };
+        let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
+            return false;
+        };
+        let drive = match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+            _ => return false,
+        };
+        let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
+        unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) != DRIVE_REMOTE_TYPE }
+    }
+
+    pub fn from_paths(
         paths: &[PathBuf],
         is_background: bool,
         shift_held: bool,
@@ -296,7 +479,7 @@ impl SelectionKey {
         capture_from_view(sv, fv2, is_background, shift_held)
     }
 
-    pub(crate) fn folder_pidl(&self) -> &OwnedPidl {
+    pub fn folder_pidl(&self) -> &OwnedPidl {
         &self.folder_pidl
     }
 
@@ -427,6 +610,14 @@ impl NativeMenu {
         shift_held: bool,
     ) -> Result<Self, ShellError> {
         let selection = SelectionKey::from_paths(paths, is_background, shift_held)?;
+        Self::build_from_selection(owner, selection)
+    }
+
+    /// Builds a native context menu from a pre-captured [`SelectionKey`] (on any STA thread).
+    pub fn build_from_selection(
+        owner: HWND,
+        selection: SelectionKey,
+    ) -> Result<Self, ShellError> {
         let menu = context_menu_from_pidls(owner, &selection)?;
         Self::query(menu, selection)
     }
@@ -509,7 +700,8 @@ impl NativeMenu {
         })
     }
 
-    pub fn track_and_invoke(
+    /// Displays the menu via `TrackPopupMenuEx` and returns the chosen command ID without invoking it.
+    pub fn track_only(
         &self,
         owner: HWND,
         anchor: (i32, i32),
@@ -541,8 +733,24 @@ impl NativeMenu {
             }
             return Ok(None);
         }
+        Ok(Some(id))
+    }
+
+    pub fn track_and_invoke(
+        &self,
+        owner: HWND,
+        anchor: (i32, i32),
+        no_animation: bool,
+    ) -> Result<Option<u32>, ShellError> {
+        let Some(id) = self.track_only(owner, anchor, no_animation)? else {
+            return Ok(None);
+        };
         self.invoke_id(id, owner, anchor)?;
         Ok(Some(id))
+    }
+
+    pub fn canonical_verb_for_id(&self, cmd_id: u32) -> Option<String> {
+        self.canonical_verb(cmd_id)
     }
 
     pub fn invoke_id(
@@ -865,6 +1073,12 @@ pub fn is_japanese_ui() -> bool {
     unsafe { GetUserDefaultUILanguage() & 0x03ff == LANG_JAPANESE }
 }
 
+/// Current Windows clipboard change counter, used to invalidate Paste cache entries automatically.
+#[inline]
+pub fn clipboard_sequence_number() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +1196,39 @@ mod tests {
         assert_eq!(clean_label("&Copy as path\tCtrl+Shift+C"), "Copy as path");
         assert_eq!(clean_label("表示(&V)…"), "表示…");
         assert_eq!(clean_label("Pin && Remove"), "Pin & Remove");
+    }
+
+    #[test]
+    fn pidl_bytes_serialization_roundtrips_and_rejects_malformed() {
+        let _sta = ComStaGuard::initialize();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let manifest = repo.join("Cargo.toml");
+        let lock = repo.join("Cargo.lock");
+        let key = SelectionKey::from_paths(&[manifest.clone(), lock], false, true).unwrap();
+        assert!(key.is_local_filesystem());
+
+        let mut buf = Vec::new();
+        assert!(key.serialize_pidls(&mut buf));
+        let restored = SelectionKey::from_serialized_pidls(&buf, true).unwrap();
+        assert!(key.matches(&restored));
+        assert_eq!(key.cache_key_hash(42), restored.cache_key_hash(42));
+        assert_ne!(key.cache_key_hash(42), restored.cache_key_hash(43));
+
+        // Reject virtual namespace (This PC) as local filesystem hover target.
+        let this_pc = OwnedPidl::parse("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").unwrap();
+        let virt = SelectionKey::new(this_pc, Vec::new(), false);
+        assert!(!virt.is_local_filesystem());
+
+        // Reject corrupt PIDL buffers safely.
+        assert!(OwnedPidl::from_bytes(&[]).is_err());
+        assert!(OwnedPidl::from_bytes(&[10, 0, 1, 2]).is_err());
+        assert!(OwnedPidl::from_bytes(&[1, 0, 0, 0]).is_err());
+        assert!(OwnedPidl::from_bytes(&[4, 0, 1, 2, 0, 0, 9]).is_err());
+        assert!(SelectionKey::from_serialized_pidls(&buf[..buf.len() - 1], true).is_err());
     }
 
     #[test]

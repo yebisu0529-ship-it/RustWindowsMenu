@@ -1,8 +1,10 @@
 pub mod build_info;
 pub mod classic;
 pub mod config;
+pub mod fasthash;
 pub mod handlers;
 pub mod inspect;
+pub mod ipc_cache;
 mod reg_util;
 pub mod shell;
 pub mod warm_pool;

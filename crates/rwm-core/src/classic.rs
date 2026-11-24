@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use windows::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -22,8 +22,10 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
-use windows_core::PWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetShellWindow, PostMessageW, WM_USER,
+};
+use windows_core::{w, PWSTR};
 
 use crate::config::local_data_dir;
 use crate::reg_util::{
@@ -384,52 +386,125 @@ fn spawn_explorer(path: &Path) -> io::Result<std::process::Child> {
         .spawn()
 }
 
+fn wait_processes(processes: &[HandleGuard], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    for process in processes {
+        let ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u32;
+        if unsafe { WaitForSingleObject(process.0, ms) } != WAIT_OBJECT_0 {
+            return false;
+        }
+    }
+    true
+}
+
+trait ExplorerRestartOps {
+    fn ask_tray_close(&self);
+    fn wait_polite(&self, timeout: Duration) -> bool;
+    fn terminate_remaining(&self) -> Result<(), ClassicError>;
+    fn wait_forced(&self, timeout: Duration) -> Result<(), ClassicError>;
+    fn has_shell_window(&self) -> bool;
+    fn spawn(&self) -> Result<(), ClassicError>;
+    fn pause(&self, duration: Duration);
+}
+
+struct LiveExplorerRestart<'a> {
+    path: &'a Path,
+    processes: Vec<HandleGuard>,
+}
+
+impl ExplorerRestartOps for LiveExplorerRestart<'_> {
+    fn ask_tray_close(&self) {
+        unsafe {
+            if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+                let _ = PostMessageW(tray, WM_USER + 436, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn wait_polite(&self, timeout: Duration) -> bool {
+        wait_processes(&self.processes, timeout)
+    }
+
+    fn terminate_remaining(&self) -> Result<(), ClassicError> {
+        for process in &self.processes {
+            if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
+                if let Err(error) = unsafe { TerminateProcess(process.0, 0) } {
+                    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_forced(&self, timeout: Duration) -> Result<(), ClassicError> {
+        let deadline = Instant::now() + timeout;
+        for process in &self.processes {
+            let ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u32;
+            match unsafe { WaitForSingleObject(process.0, ms) } {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => {
+                    let _ = spawn_explorer(self.path);
+                    return Err(ClassicError::ExplorerRestart(
+                        "Explorer did not exit in time".into(),
+                    ));
+                }
+                _ => {
+                    let _ = spawn_explorer(self.path);
+                    return Err(windows_core::Error::from_win32().into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_shell_window(&self) -> bool {
+        !unsafe { GetShellWindow() }.is_invalid()
+    }
+
+    fn spawn(&self) -> Result<(), ClassicError> {
+        spawn_explorer(self.path)?;
+        Ok(())
+    }
+
+    fn pause(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+fn restart_with(ops: &impl ExplorerRestartOps) -> Result<(), ClassicError> {
+    ops.ask_tray_close();
+    if !ops.wait_polite(Duration::from_secs(5)) {
+        ops.terminate_remaining()?;
+        ops.wait_forced(Duration::from_secs(5))?;
+    }
+    let step = Duration::from_millis(100);
+    let mut watched = Duration::ZERO;
+    while watched < Duration::from_millis(1500) {
+        if ops.has_shell_window() {
+            return Ok(());
+        }
+        ops.pause(step);
+        watched += step;
+    }
+    ops.spawn()
+}
+
 pub fn restart_explorer() -> Result<(), ClassicError> {
     let _lock = acquire_named_mutex(LOCK)?;
     let mut session = 0;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session)? };
     let path = explorer_path()?;
     let processes = explorer_processes(session, &path)?;
-    for process in &processes {
-        if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
-            if let Err(error) = unsafe { TerminateProcess(process.0, 0) } {
-                if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    for process in processes {
-        let ms = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis() as u32;
-        match unsafe { WaitForSingleObject(process.0, ms) } {
-            WAIT_OBJECT_0 => {}
-            WAIT_TIMEOUT => {
-                let _ = spawn_explorer(&path);
-                return Err(ClassicError::ExplorerRestart(
-                    "Explorer did not exit in time".into(),
-                ));
-            }
-            _ => {
-                let _ = spawn_explorer(&path);
-                return Err(windows_core::Error::from_win32().into());
-            }
-        }
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if !unsafe { GetShellWindow() }.is_invalid() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    spawn_explorer(&path)?;
-    Ok(())
+    restart_with(&LiveExplorerRestart {
+        path: &path,
+        processes,
+    })
 }
 
 #[cfg(test)]
@@ -568,5 +643,61 @@ mod tests {
             .unwrap()
             .is_none());
         let _ = fs::remove_file(&corrupt);
+    }
+
+    #[test]
+    fn explorer_restart_tries_polite_close_before_terminating() {
+        use std::cell::RefCell;
+
+        struct FakeOps {
+            polite_ok: bool,
+            restored: bool,
+            steps: RefCell<Vec<&'static str>>,
+        }
+
+        impl ExplorerRestartOps for FakeOps {
+            fn ask_tray_close(&self) {
+                self.steps.borrow_mut().push("ask_tray");
+            }
+            fn wait_polite(&self, _: Duration) -> bool {
+                self.steps.borrow_mut().push("wait_polite");
+                self.polite_ok
+            }
+            fn terminate_remaining(&self) -> Result<(), ClassicError> {
+                self.steps.borrow_mut().push("terminate");
+                Ok(())
+            }
+            fn wait_forced(&self, _: Duration) -> Result<(), ClassicError> {
+                self.steps.borrow_mut().push("wait_forced");
+                Ok(())
+            }
+            fn has_shell_window(&self) -> bool {
+                self.steps.borrow_mut().push("check_shell");
+                self.restored
+            }
+            fn spawn(&self) -> Result<(), ClassicError> {
+                self.steps.borrow_mut().push("spawn");
+                Ok(())
+            }
+            fn pause(&self, _: Duration) {}
+        }
+
+        let polite = FakeOps {
+            polite_ok: true,
+            restored: true,
+            steps: RefCell::new(Vec::new()),
+        };
+        restart_with(&polite).unwrap();
+        assert_eq!(*polite.steps.borrow(), ["ask_tray", "wait_polite", "check_shell"]);
+
+        let fallback = FakeOps {
+            polite_ok: false,
+            restored: false,
+            steps: RefCell::new(Vec::new()),
+        };
+        restart_with(&fallback).unwrap();
+        let steps = fallback.steps.borrow();
+        assert_eq!(&steps[..4], ["ask_tray", "wait_polite", "terminate", "wait_forced"]);
+        assert_eq!(steps.last(), Some(&"spawn"));
     }
 }

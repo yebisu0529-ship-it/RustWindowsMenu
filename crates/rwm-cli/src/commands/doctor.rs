@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use rwm_core::build_info::ABI_VERSION;
+use rwm_core::ipc_cache::SharedCacheClient;
 use rwm_core::{classic, handlers};
 use serde::Serialize;
 
@@ -90,7 +92,7 @@ pub fn run(args: &DoctorArgs) -> CliResult<ExitCode> {
             if probe.is_usable() {
                 checks.push(Check::pass(
                     "Hook DLL",
-                    format!("{} ABI 2 BUILD_ID match", path.display()),
+                    format!("{} ABI {ABI_VERSION} BUILD_ID match", path.display()),
                 ));
             } else {
                 checks.push(Check::fail("Hook DLL", probe.problems.join("; ")));
@@ -98,7 +100,14 @@ pub fn run(args: &DoctorArgs) -> CliResult<ExitCode> {
         }
     }
     match host::host_state(host::HOST_MUTEX_NAME) {
-        host::HostState::Running => checks.push(Check::pass("Host", "running")),
+        host::HostState::Running => {
+            let detail = if SharedCacheClient::open().is_some_and(|c| c.is_valid()) {
+                "running (speculative cache active)"
+            } else {
+                "running"
+            };
+            checks.push(Check::pass("Host", detail));
+        }
         host::HostState::RunningOtherIntegrity => checks.push(Check::warn(
             "Host",
             "running at another integrity level (stop it from that terminal)",

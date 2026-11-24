@@ -42,6 +42,18 @@ pub struct RwmConfig {
     pub classic_menu_fallback: bool,
     #[serde(default)]
     pub debug_logging: bool,
+    #[serde(default = "default_true")]
+    pub hover_prebuild: bool,
+    #[serde(default = "default_hover_delay")]
+    pub hover_delay_ms: u32,
+    #[serde(default = "default_true")]
+    pub selection_prebuild: bool,
+    #[serde(default = "default_true")]
+    pub host_menu_cache: bool,
+    #[serde(default = "default_host_cache_entries")]
+    pub host_cache_entries: usize,
+    #[serde(default = "default_host_cache_ttl")]
+    pub host_cache_ttl_ms: u32,
 }
 
 fn default_true() -> bool {
@@ -52,6 +64,15 @@ fn default_arm_delay() -> u32 {
 }
 fn default_max_pinned() -> usize {
     32
+}
+fn default_hover_delay() -> u32 {
+    120
+}
+fn default_host_cache_entries() -> usize {
+    6
+}
+fn default_host_cache_ttl() -> u32 {
+    8000
 }
 
 impl Default for RwmConfig {
@@ -65,6 +86,12 @@ impl Default for RwmConfig {
             max_pinned_dlls: default_max_pinned(),
             classic_menu_fallback: false,
             debug_logging: false,
+            hover_prebuild: default_true(),
+            hover_delay_ms: default_hover_delay(),
+            selection_prebuild: default_true(),
+            host_menu_cache: default_true(),
+            host_cache_entries: default_host_cache_entries(),
+            host_cache_ttl_ms: default_host_cache_ttl(),
         }
     }
 }
@@ -144,6 +171,9 @@ impl RwmConfig {
     pub fn validated(mut self) -> Self {
         self.arm_delay_ms = self.arm_delay_ms.min(100);
         self.max_pinned_dlls = self.max_pinned_dlls.min(128);
+        self.hover_delay_ms = self.hover_delay_ms.clamp(40, 1000);
+        self.host_cache_entries = self.host_cache_entries.clamp(1, 16);
+        self.host_cache_ttl_ms = self.host_cache_ttl_ms.clamp(1000, 30000);
         self
     }
 
@@ -179,13 +209,16 @@ mod tests {
             RwmConfig::default()
         );
         let config = toml::from_str::<RwmConfig>(
-            "arm_delay_ms = 250\nmax_pinned_dlls = 500\nno_animation = false",
+            "arm_delay_ms = 250\nmax_pinned_dlls = 500\nno_animation = false\nhover_delay_ms = 10\nhost_cache_entries = 99\nhost_cache_ttl_ms = 999999",
         )
         .unwrap()
         .validated();
         assert_eq!(config.arm_delay_ms, 100);
         assert_eq!(config.max_pinned_dlls, 128);
         assert!(!config.no_animation);
+        assert_eq!(config.hover_delay_ms, 40);
+        assert_eq!(config.host_cache_entries, 16);
+        assert_eq!(config.host_cache_ttl_ms, 30000);
         let raw = toml::to_string_pretty(&config).unwrap();
         assert_eq!(toml::from_str::<RwmConfig>(&raw).unwrap(), config);
     }

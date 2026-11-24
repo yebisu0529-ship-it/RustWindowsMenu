@@ -3,6 +3,7 @@
 
 use std::ffi::c_void;
 
+use rwm_core::shell::{capture_from_view, OwnedPidl, SelectionKey};
 use windows::core::{w, IUnknown, Interface, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -10,19 +11,20 @@ use windows::Win32::System::Com::{CoCreateInstance, IDispatch, IServiceProvider,
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::{VariantChangeType, VT_UNKNOWN};
 use windows::Win32::UI::Accessibility::{
-    AccessibleObjectFromPoint, AccessibleObjectFromWindow, IAccessible,
+    AccessibleObjectFromPoint, AccessibleObjectFromWindow, IAccessible, ROLE_SYSTEM_LISTITEM,
 };
 use windows::Win32::UI::Controls::{
     LVHITTESTINFO, LVIR_BOUNDS, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_HITTEST, LVNI_FOCUSED,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_F2;
 use windows::Win32::UI::Shell::{
     IFolderView, IFolderView2, IShellBrowser, IShellView, IShellWindows, IWebBrowserApp,
-    SID_STopLevelBrowser, ShellWindows, SVGIO_SELECTION, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    SID_STopLevelBrowser, ShellWindows, SVGIO_SELECTION, SVSI_EDIT, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetAncestor, GetClassNameW, GetWindowRect, GetWindowThreadProcessId,
-    SendMessageW, WindowFromPoint, CHILDID_SELF, GA_ROOT, HTCLIENT, OBJID_CLIENT, WM_NCHITTEST,
-    WM_USER,
+    PostMessageW, SendMessageW, WindowFromPoint, CHILDID_SELF, GA_ROOT, HTCLIENT, OBJID_CLIENT,
+    WM_KEYDOWN, WM_NCHITTEST, WM_USER,
 };
 
 use crate::gesture::{self, Hit};
@@ -222,10 +224,118 @@ pub(crate) fn client_to_screen(window: HWND, mut point: POINT) -> Option<POINT> 
         .then_some(point)
 }
 
+pub(crate) fn root_window(window: HWND) -> HWND {
+    unsafe { GetAncestor(window, GA_ROOT) }
+}
+
 pub(crate) fn window_rect(window: HWND) -> RECT {
     let mut rect = RECT::default();
     let _ = unsafe { GetWindowRect(window, &mut rect) };
     rect
+}
+
+/// Resolves a local-filesystem `SelectionKey` from a hovered item without changing Explorer's focus
+/// or querying COM context menus on the UI thread.
+pub(crate) fn selection_from_hover(
+    defview: HWND,
+    child: HWND,
+    kind: ChildKind,
+    screen: POINT,
+    shift: bool,
+) -> Option<SelectionKey> {
+    if unsafe { WindowFromPoint(screen) } != child {
+        return None;
+    }
+    match kind {
+        ChildKind::ListView => {
+            let mut info = LVHITTESTINFO {
+                pt: screen,
+                ..Default::default()
+            };
+            unsafe { ScreenToClient(child, &mut info.pt) }.ok().ok()?;
+            let info_ptr = LPARAM(&mut info as *mut LVHITTESTINFO as isize);
+            let item = unsafe { SendMessageW(child, LVM_HITTEST, WPARAM(0), info_ptr) }.0;
+            if item < 0 {
+                return None;
+            }
+            let view = ShellView::find(defview)?;
+            let fv: IFolderView = view.view.cast().ok()?;
+            let folder_key =
+                capture_from_view(&view.view, view.folder_view.as_ref(), true, shift).ok()?;
+            if !folder_key.is_local_filesystem() {
+                return None;
+            }
+            let rel_raw = unsafe { fv.Item(item as i32) }.ok()?;
+            let rel = unsafe { OwnedPidl::from_raw_owned(rel_raw) };
+            let full = unsafe { folder_key.folder_pidl().combine_child_raw(rel.as_ptr()) }.ok()?;
+            let key = SelectionKey::new(folder_key.folder_pidl().clone(), vec![full], shift);
+            key.is_local_filesystem().then_some(key)
+        }
+        ChildKind::ItemsView => {
+            let (mut accessible, mut id) = (None, VARIANT::new());
+            unsafe { AccessibleObjectFromPoint(screen, &mut accessible, &mut id) }.ok()?;
+            let mut node = Some((accessible?, id));
+            let mut item_name = None;
+            for _ in 0..6 {
+                let Some((acc, cur_id)) = node.take() else {
+                    break;
+                };
+                let role = unsafe { acc.get_accRole(&cur_id) }
+                    .ok()
+                    .and_then(|v| u32::try_from(&v).ok());
+                if role == Some(ROLE_SYSTEM_LISTITEM) {
+                    item_name = unsafe { acc.get_accName(&cur_id) }.ok().map(|b| b.to_string());
+                    break;
+                }
+                if matches!(
+                    role.and_then(|r| gesture::classify_roles([r])),
+                    Some(gesture::Hit::Background | gesture::Hit::Other)
+                ) {
+                    break;
+                }
+                node = if is_self(&cur_id) {
+                    unsafe { acc.accParent() }
+                        .ok()
+                        .and_then(|parent| parent.cast().ok())
+                        .map(|parent| (parent, self_id()))
+                } else {
+                    Some((acc, self_id()))
+                };
+            }
+            let name = item_name.filter(|s| !s.is_empty() && !s.contains(['\\', '/', '\0']))?;
+            let view = ShellView::find(defview)?;
+            let folder_key =
+                capture_from_view(&view.view, view.folder_view.as_ref(), true, shift).ok()?;
+            if !folder_key.is_local_filesystem() {
+                return None;
+            }
+            let candidate = folder_key.folder_fs_path()?.join(name);
+            std::fs::symlink_metadata(&candidate).ok()?;
+            let key = SelectionKey::from_paths(&[candidate], false, shift).ok()?;
+            key.is_local_filesystem().then_some(key)
+        }
+    }
+}
+
+/// Starts inline rename in the live Explorer view (for `rename` invoked out of `rwm-host.exe`).
+pub(crate) fn trigger_inline_rename(defview: HWND, child: HWND) {
+    if let Some(view) = ShellView::find(defview) {
+        if let Ok(fv) = view.view.cast::<IFolderView>() {
+            if let Ok(idx) = unsafe { fv.GetFocusedItem() } {
+                if let Ok(raw) = unsafe { fv.Item(idx) } {
+                    let pidl = unsafe { OwnedPidl::from_raw_owned(raw) };
+                    if unsafe { view.view.SelectItem(pidl.as_ptr(), SVSI_EDIT.0 as u32) }.is_ok() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if !child.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(child, WM_KEYDOWN, WPARAM(VK_F2.0 as usize), LPARAM(0));
+        }
+    }
 }
 
 /// The screen center of the focused item, where a keyboard-raised menu opens.

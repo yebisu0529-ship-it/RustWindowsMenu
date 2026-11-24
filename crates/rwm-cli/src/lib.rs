@@ -4,6 +4,7 @@ pub mod error;
 pub mod explorer;
 pub mod hookdll;
 pub mod host;
+pub mod menu_cache;
 pub mod output;
 pub mod probe;
 pub mod reg;

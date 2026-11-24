@@ -28,10 +28,15 @@ pub(crate) enum Gesture<M> {
     Ready {
         child: HWND,
         down: POINT,
+        down_screen: POINT,
+        background: bool,
         menu: M,
         built_at: Instant,
         timer_id: usize,
     },
+    /// Right-press was queued to `rwm-host.exe` at `t = 0 ms`; preserves `down_screen` so release
+    /// can skip duplicate `AccessibleObjectFromPoint` hit-testing.
+    HostPrefetched { down: POINT, down_screen: POINT },
 }
 
 impl<M> Gesture<M> {
@@ -88,25 +93,114 @@ impl<M> Gesture<M> {
         }
     }
 
-    /// True once a pressed/ready gesture has left the system drag rectangle and become a right-drag.
+    /// True once a pressed/ready/host-prefetched gesture has left the system drag rectangle.
     pub(crate) fn is_drag(&self, at: POINT, (cx, cy): (i32, i32)) -> bool {
         let down = match self {
-            Self::Armed { down, .. } | Self::Ready { down, .. } => down,
+            Self::Armed { down, .. }
+            | Self::Ready { down, .. }
+            | Self::HostPrefetched { down, .. } => down,
             Self::Idle => return false,
         };
         (at.x - down.x).abs() > cx || (at.y - down.y).abs() > cy
     }
 
-    pub(crate) fn into_fresh_menu(self, now: Instant) -> Option<M> {
+    /// Consumes the gesture and returns `(optional ready menu, optional hit cache (down_screen, background))`.
+    pub(crate) fn take_for_context_menu(self, now: Instant) -> (Option<M>, Option<(POINT, bool)>) {
         match self {
-            Self::Ready { menu, built_at, .. }
-                if now.saturating_duration_since(built_at) < READY_TTL =>
-            {
-                Some(menu)
+            Self::Ready {
+                down_screen,
+                background,
+                menu,
+                built_at,
+                ..
+            } if now.saturating_duration_since(built_at) < READY_TTL => {
+                (Some(menu), Some((down_screen, background)))
             }
-            _ => None,
+            Self::HostPrefetched { down_screen, .. } => (None, Some((down_screen, false))),
+            _ => (None, None),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoverAction {
+    None,
+    ReArm(u32),
+    Prefetch(POINT),
+}
+
+/// Coalesces hover dwell checks without re-arming timers inside the deadzone jitter band.
+#[derive(Debug, Default)]
+pub(crate) struct HoverTracker {
+    pub(crate) last_pt: Option<POINT>,
+    pub(crate) last_move_tick_ms: u64,
+    pub(crate) timer_active: bool,
+    pub(crate) last_prefetched_pt: Option<POINT>,
+}
+
+impl HoverTracker {
+    /// Records pointer movement (`client` coordinates). Returns `true` when caller should start
+    /// a new coalesced timer; subsequent movements reset `last_move_tick_ms` with zero syscalls.
+    #[inline]
+    pub(crate) fn on_move(&mut self, pt: POINT, now_ms: u64, deadzone_px: i32) -> bool {
+        if let Some(prev) = self.last_pt {
+            if (pt.x - prev.x).abs() <= deadzone_px && (pt.y - prev.y).abs() <= deadzone_px {
+                return false;
+            }
+        }
+        self.last_pt = Some(pt);
+        self.last_move_tick_ms = now_ms;
+        if self.timer_active {
+            false
+        } else {
+            self.timer_active = true;
+            true
+        }
+    }
+
+    pub(crate) fn on_timer(
+        &mut self,
+        now_ms: u64,
+        dwell_ms: u32,
+        deadzone_px: i32,
+    ) -> HoverAction {
+        let Some(pt) = self.last_pt else {
+            self.timer_active = false;
+            return HoverAction::None;
+        };
+        let elapsed = now_ms.saturating_sub(self.last_move_tick_ms);
+        if elapsed < u64::from(dwell_ms) {
+            let remaining = (u64::from(dwell_ms) - elapsed).max(15).min(u64::from(dwell_ms)) as u32;
+            self.timer_active = true;
+            return HoverAction::ReArm(remaining);
+        }
+        self.timer_active = false;
+        if let Some(prev) = self.last_prefetched_pt {
+            if (pt.x - prev.x).abs() <= deadzone_px && (pt.y - prev.y).abs() <= deadzone_px {
+                return HoverAction::None;
+            }
+        }
+        HoverAction::Prefetch(pt)
+    }
+
+    pub(crate) fn mark_prefetched(&mut self, pt: POINT) {
+        self.last_prefetched_pt = Some(pt);
+    }
+
+    pub(crate) fn reset(&mut self) -> bool {
+        let was_active = self.timer_active;
+        self.last_pt = None;
+        self.last_move_tick_ms = 0;
+        self.timer_active = false;
+        self.last_prefetched_pt = None;
+        was_active
+    }
+}
+
+/// True when `a` and `b` lie within Windows drag tolerances `(cx, cy)`.
+#[inline]
+pub(crate) fn within_drag_rect(a: POINT, b: POINT, (cx, cy): (i32, i32)) -> bool {
+    (a.x - b.x).abs() <= cx && (a.y - b.y).abs() <= cy
 }
 
 /// What a point inside a folder view lands on.
@@ -219,6 +313,8 @@ mod tests {
         let ready = Gesture::Ready {
             child: window(1),
             down: POINT { x: 100, y: 100 },
+            down_screen: POINT { x: 200, y: 200 },
+            background: false,
             menu: "menu",
             built_at: Instant::now(),
             timer_id: 0x5257_4E01,
@@ -233,21 +329,33 @@ mod tests {
         let ready = || Gesture::Ready {
             child: window(1),
             down: POINT { x: 100, y: 100 },
+            down_screen: POINT { x: 200, y: 200 },
+            background: true,
             menu: "menu",
             built_at,
             timer_id: 0x5257_4E01,
         };
         assert_eq!(
-            ready().into_fresh_menu(built_at + READY_TTL / 2),
-            Some("menu")
+            ready().take_for_context_menu(built_at + READY_TTL / 2),
+            (Some("menu"), Some((POINT { x: 200, y: 200 }, true)))
         );
-        assert_eq!(ready().into_fresh_menu(built_at + READY_TTL), None);
-        assert_eq!(armed(1).into_fresh_menu(built_at), None);
+        assert_eq!(ready().take_for_context_menu(built_at + READY_TTL), (None, None));
+        assert_eq!(armed(1).take_for_context_menu(built_at), (None, None));
         assert_eq!(ready().armed_timer(), None);
         let mut expiring = ready();
         assert_eq!(expiring.expire(window(1), 0x5257_4E02), None);
         assert_eq!(expiring.expire(window(1), 0x5257_4E01), Some("menu"));
         assert!(matches!(expiring, Gesture::Idle));
+
+        let host_prefetched: Gesture<&str> = Gesture::HostPrefetched {
+            down: POINT { x: 10, y: 10 },
+            down_screen: POINT { x: 500, y: 500 },
+        };
+        assert!(host_prefetched.is_drag(POINT { x: 20, y: 10 }, (4, 4)));
+        assert_eq!(
+            host_prefetched.take_for_context_menu(built_at),
+            (None, Some((POINT { x: 500, y: 500 }, false)))
+        );
     }
 
     #[test]
@@ -298,5 +406,34 @@ mod tests {
             keyboard_anchor(Some(scrolled_away), view),
             POINT { x: 170, y: 400 }
         );
+    }
+
+    #[test]
+    fn hover_tracker_coalesces_jitter_respects_dwell_and_resets() {
+        let mut tracker = HoverTracker::default();
+        assert!(tracker.on_move(POINT { x: 100, y: 100 }, 1_000, 3));
+        // Deadzone jitter does not re-arm or bump timestamp.
+        assert!(!tracker.on_move(POINT { x: 102, y: 98 }, 1_050, 3));
+        assert_eq!(tracker.last_move_tick_ms, 1_000);
+        // Moving outside deadzone while timer active updates timestamp without requesting SetTimer.
+        assert!(!tracker.on_move(POINT { x: 120, y: 100 }, 1_070, 3));
+        assert_eq!(tracker.last_move_tick_ms, 1_070);
+        // Before dwell expires, asks for remaining wait.
+        assert_eq!(tracker.on_timer(1_110, 120, 3), HoverAction::ReArm(80));
+        // Once dwell elapses, requests prefetch and marks point to avoid duplicate fires.
+        assert_eq!(
+            tracker.on_timer(1_195, 120, 3),
+            HoverAction::Prefetch(POINT { x: 120, y: 100 })
+        );
+        tracker.mark_prefetched(POINT { x: 120, y: 100 });
+        assert!(tracker.on_move(POINT { x: 125, y: 100 }, 1_300, 3));
+        assert_eq!(
+            tracker.on_timer(1_450, 120, 3),
+            HoverAction::Prefetch(POINT { x: 125, y: 100 })
+        );
+        tracker.mark_prefetched(POINT { x: 125, y: 100 });
+        assert!(!tracker.on_move(POINT { x: 126, y: 100 }, 1_500, 3));
+        assert!(!tracker.reset());
+        assert!(tracker.last_pt.is_none());
     }
 }
