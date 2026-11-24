@@ -296,14 +296,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
 name = "rwm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rwm-core",
- "rwm-ui",
  "serde",
  "serde_json",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "windows",
@@ -311,32 +317,23 @@ dependencies = [
 
 [[package]]
 name = "rwm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
+ "roxmltree",
  "serde",
  "serde_json",
  "thiserror",
  "toml",
  "tracing",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
 name = "rwm-hook"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "rwm-core",
- "rwm-ui",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "rwm-ui"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
  "rwm-core",
  "tracing",
  "windows",

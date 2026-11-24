@@ -1,340 +1,161 @@
-//! Drives the built `rwm.exe` the way a user does.
-//!
-//! Only read-only commands run here. Nothing in this file may invoke `run`, `install`,
-//! `uninstall`, or `classic enable|disable` with the hook DLL present, because those change
-//! the live registry or attach to the real Explorer.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-
-/// A scratch folder that is deleted when the test ends.
+static NEXT: AtomicU32 = AtomicU32::new(0);
 struct Scratch(PathBuf);
-
 impl Scratch {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "rwm_cli_e2e_{}_{}_{label}",
+            "rwm_v02_cli_{}_{}_{label}",
             std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).expect("create scratch dir");
+        fs::create_dir_all(&path).unwrap();
         Self(path)
     }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
 }
-
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
-/// `rwm.exe` with its config pointed into the scratch folder, away from the user's own.
 fn rwm(scratch: &Scratch) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rwm"));
-    command.env("RWM_CONFIG", scratch.path().join("config.toml"));
+    command.env("RWM_CONFIG", scratch.0.join("config.toml"));
     command
 }
-
 fn run(command: &mut Command) -> Output {
-    command.output().expect("rwm.exe starts")
+    command.output().expect("run rwm")
 }
-
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|err| panic!("stdout is not JSON ({err}):\n{}", stdout(output)))
+        .unwrap_or_else(|error| panic!("{error}: {}", stdout(output)))
 }
 
 #[test]
-fn version_and_help_list_the_command_suite() {
+fn help_lists_complete_v02_surface_and_hides_probe_worker() {
     let scratch = Scratch::new("help");
-
-    let version = run(rwm(&scratch).arg("--version"));
-    assert!(version.status.success());
-    assert_eq!(
-        stdout(&version).trim(),
-        format!("rwm {}", env!("CARGO_PKG_VERSION"))
-    );
-
     let help = stdout(&run(rwm(&scratch).arg("--help")));
-    for subcommand in [
-        "status",
-        "classic",
-        "bench",
-        "handlers",
-        "preview",
-        "run",
-        "stop",
+    for command in [
         "install",
         "uninstall",
-        "config",
+        "start",
+        "stop",
+        "status",
         "doctor",
+        "bench",
+        "inspect",
+        "preview",
+        "handlers",
+        "classic",
+        "config",
+        "run",
     ] {
         assert!(
             help.lines()
-                .any(|line| line.trim_start().starts_with(subcommand)),
-            "help does not list `{subcommand}`:\n{help}"
+                .any(|line| line.trim_start().starts_with(command)),
+            "missing {command}:\n{help}"
         );
     }
+    assert!(!help.contains("__probe-worker"));
 }
 
 #[test]
-fn config_commands_create_and_validate_the_file() {
+fn config_roundtrip_show_init_reset_and_strict_errors() {
     let scratch = Scratch::new("config");
-    let config = scratch.path().join("config.toml");
-
     let path = run(rwm(&scratch).args(["config", "path"]));
-    assert_eq!(stdout(&path).trim(), config.display().to_string());
-
-    let missing = run(rwm(&scratch).args(["config", "validate"]));
-    assert!(missing.status.success(), "a missing config means defaults");
-    assert!(stdout(&missing).contains("built-in defaults apply"));
-
-    let created = run(rwm(&scratch).args(["config", "init"]));
-    assert!(created.status.success());
-    assert!(stdout(&created).starts_with("Created the default config"));
-    let written = fs::read_to_string(&config).expect("config init wrote the file");
-
-    let again = run(rwm(&scratch).args(["config", "init"]));
-    assert!(stdout(&again).contains("left unchanged"));
-    assert_eq!(fs::read_to_string(&config).unwrap(), written);
-
-    let valid = run(rwm(&scratch).args(["config", "validate"]));
-    assert!(valid.status.success());
-    assert!(stdout(&valid).contains("(valid)"));
-
-    fs::write(&config, "[handlers]\ndefault_policy = \"sideways\"\n").unwrap();
-    let invalid = run(rwm(&scratch).args(["config", "validate"]));
-    assert_eq!(invalid.status.code(), Some(1));
-    assert!(stdout(&invalid).contains("INVALID"));
-}
-
-#[test]
-fn status_json_reports_every_section() {
-    let scratch = Scratch::new("status");
-
-    let output = run(rwm(&scratch).args(["status", "--json"]));
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report = json(&output);
-
-    assert_eq!(report["rwm_version"], env!("CARGO_PKG_VERSION"));
-    assert!(report["classic"]["windows_build"].is_u64());
-    assert!(report["classic"]["classic_menu_enabled"].is_boolean());
-    assert_eq!(report["config"]["exists"], false);
-    assert_eq!(report["config"]["valid"], true);
-    assert!(report["kill_switch"]["active"].is_boolean());
-    assert!(report["hook_dll"]["found"].is_boolean());
-    assert!(report["explorer"]["ui_threads"].is_u64());
-    assert!(report["hook_host_running"].is_boolean());
-
-    let text = stdout(&run(rwm(&scratch).arg("status")));
-    for label in [
-        "Windows",
-        "Classic menu",
-        "MenuShowDelay",
-        "Backup",
-        "Config",
-        "Kill switch",
-        "Hook DLL",
-        "Explorer",
-    ] {
-        assert!(
-            text.contains(label),
-            "status does not show `{label}`:\n{text}"
-        );
-    }
-}
-
-#[test]
-fn handlers_list_describes_the_target_and_its_handlers() {
-    let scratch = Scratch::new("handlers");
-    let file = scratch.path().join("notes.txt");
-    fs::write(&file, "hello").unwrap();
-
-    let output = run(rwm(&scratch)
-        .args(["handlers", "list", "--json"])
-        .arg(&file));
-    assert!(output.status.success(), "{}", stderr(&output));
-    let listing = json(&output);
-    assert_eq!(listing["target"]["kind"], "file");
-    assert_eq!(listing["target"]["origin"], "explicit");
-    assert_eq!(listing["default_policy"], "inline");
-    assert!(listing["static_verbs"].is_array());
-    let handlers = listing["com_handlers"].as_array().expect("com_handlers");
-    for handler in handlers {
-        assert!(handler["clsid"].as_str().unwrap().starts_with('{'));
-        assert!(matches!(
-            handler["policy"].as_str(),
-            Some("inline" | "submenu" | "disabled")
-        ));
-    }
-
-    let background = run(rwm(&scratch)
-        .args(["handlers", "list", "--background", "--json"])
-        .current_dir(scratch.path()));
-    assert_eq!(json(&background)["target"]["kind"], "folder background");
-    assert_eq!(json(&background)["target"]["origin"], "current_dir");
-}
-
-#[test]
-fn config_policy_overrides_show_up_in_the_listing() {
-    let scratch = Scratch::new("policy");
+    assert_eq!(
+        stdout(&path).trim(),
+        scratch.0.join("config.toml").display().to_string()
+    );
+    assert!(run(rwm(&scratch).args(["config", "show"])).status.success());
+    assert!(run(rwm(&scratch).args(["config", "init"])).status.success());
+    let config = fs::read_to_string(scratch.0.join("config.toml")).unwrap();
+    toml::from_str::<rwm_core::config::RwmConfig>(&config).unwrap();
+    assert!(!run(rwm(&scratch).args(["config", "init"])).status.success());
+    fs::write(scratch.0.join("config.toml"), "arm_delay_ms = 99\n").unwrap();
+    assert!(run(rwm(&scratch).args(["config", "init", "--force"]))
+        .status
+        .success());
     fs::write(
-        scratch.path().join("config.toml"),
-        "[handlers]\ndefault_policy = \"submenu\"\n",
+        scratch.0.join("config.toml"),
+        "[appearance]\ntheme = 'dark'\n",
     )
     .unwrap();
-
-    let output = run(rwm(&scratch)
-        .args(["handlers", "list", "--background", "--json"])
-        .current_dir(scratch.path()));
-    let listing = json(&output);
-    assert_eq!(listing["default_policy"], "submenu");
-    for handler in listing["com_handlers"].as_array().expect("com_handlers") {
-        assert_eq!(handler["policy"], "submenu");
-    }
+    assert!(!run(rwm(&scratch).args(["config", "show"])).status.success());
+    assert!(run(rwm(&scratch).args(["config", "reset"]))
+        .status
+        .success());
 }
 
 #[test]
-fn bad_targets_fail_with_a_clear_message() {
-    let scratch = Scratch::new("bad_target");
-    let file = scratch.path().join("notes.txt");
-    fs::write(&file, "hello").unwrap();
-
-    let missing = run(rwm(&scratch)
-        .arg("bench")
-        .arg(scratch.path().join("nope.bin")));
-    assert_eq!(missing.status.code(), Some(1));
-    assert!(stderr(&missing).starts_with("error: path does not exist:"));
-    assert!(stdout(&missing).is_empty());
-
-    let file_as_background = run(rwm(&scratch).args(["preview", "--background"]).arg(&file));
-    assert_eq!(file_as_background.status.code(), Some(1));
-    assert!(stderr(&file_as_background).contains("--background needs a folder"));
-
-    let unknown = run(rwm(&scratch).arg("explode"));
-    assert_eq!(
-        unknown.status.code(),
-        Some(2),
-        "clap rejects unknown commands"
-    );
-}
-
-#[test]
-fn doctor_exit_code_follows_its_report() {
-    let scratch = Scratch::new("doctor");
-
-    let output = run(rwm(&scratch).arg("doctor"));
-    let report = stdout(&output);
-    for check in [
-        "Windows 11",
-        "Direct2D + DirectWrite",
-        "Hook DLL present",
-        "Config",
-        "Kill switch",
-        "HKCU registry write",
-    ] {
-        assert!(
-            report.contains(check),
-            "doctor does not run `{check}`:\n{report}"
-        );
-    }
-    assert_eq!(
-        output.status.success(),
-        !report.contains("[FAIL]"),
-        "a failed check must make doctor exit non-zero:\n{report}"
-    );
-
-    fs::write(scratch.path().join("config.toml"), "[appearance\n").unwrap();
-    let broken = run(rwm(&scratch).arg("doctor"));
-    assert_eq!(broken.status.code(), Some(1));
-    assert!(stdout(&broken).contains("[FAIL] Config"));
-}
-
-/// With no hook DLL beside it, `rwm run` has nothing to attach and must stop right there.
-#[test]
-fn run_without_the_hook_dll_says_what_is_missing() {
-    let scratch = Scratch::new("no_dll");
-    let lonely_exe = scratch.path().join("rwm.exe");
-    fs::copy(env!("CARGO_BIN_EXE_rwm"), &lonely_exe).expect("copy rwm.exe");
-
-    let output = run(Command::new(&lonely_exe).arg("run"));
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).starts_with("error: rwm_hook.dll was not found"));
-    assert!(stdout(&output).is_empty(), "nothing was started");
-}
-
-#[test]
-#[ignore = "loads every COM shell extension registered on this PC; run with --ignored"]
-fn bench_profiles_a_real_file() {
-    let scratch = Scratch::new("bench");
-    let file = scratch.path().join("notes.txt");
-    fs::write(&file, "hello").unwrap();
-
-    let output = run(rwm(&scratch).args(["bench", "--json"]).arg(&file));
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report = json(&output);
-
-    assert_eq!(report["target"]["kind"], "file");
-    assert!(report["stage0_us"].as_u64().unwrap() > 0);
-    assert!(report["stage0_item_count"].as_u64().unwrap() > 0);
-    assert!(report["speedup_factor"].as_f64().unwrap() >= 1.0);
-    let durations: Vec<u64> = report["com_handlers"]
-        .as_array()
-        .expect("com_handlers")
-        .iter()
-        .map(|handler| handler["duration_us"].as_u64().unwrap())
-        .collect();
+fn read_only_status_and_handlers_json_are_machine_readable() {
+    let scratch = Scratch::new("readonly");
+    let status = run(rwm(&scratch).args(["status", "--json"]));
     assert!(
-        durations.windows(2).all(|pair| pair[0] >= pair[1]),
-        "handlers are listed slowest first: {durations:?}"
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
     );
+    let report = json(&status);
+    assert_eq!(report["abi_version"], 2);
+    assert!(report["config"]["valid"].as_bool().unwrap());
+    assert!(report["host_running"].is_boolean());
+    let handlers = run(rwm(&scratch).args(["handlers", "list", "--json"]));
+    assert!(handlers.status.success());
+    assert!(json(&handlers).is_array());
 }
 
 #[test]
-#[ignore = "opens the real popup menu on screen for a moment; run with --ignored"]
-fn preview_smoke_test_renders_and_exits() {
-    let scratch = Scratch::new("preview");
-    let file = scratch.path().join("notes.txt");
-    fs::write(&file, "hello").unwrap();
-
-    let output = run(rwm(&scratch)
-        .args(["preview", "--smoke-test-ms", "400"])
-        .arg(&file));
-    assert!(output.status.success(), "{}", stderr(&output));
-
-    let text = stdout(&output);
-    let summary = text
-        .lines()
-        .find(|line| line.starts_with("preview smoke-test: "))
-        .unwrap_or_else(|| panic!("no summary line in:\n{text}"));
-    let keys: Vec<&str> = summary["preview smoke-test: ".len()..]
-        .split(' ')
-        .filter_map(|pair| pair.split_once('=').map(|(key, _)| key))
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            "rendered_with_d2d",
-            "stage0_us",
-            "hydrated_groups",
-            "final_item_count"
-        ]
-    );
+fn invalid_targets_fail_before_any_shell_or_registry_change() {
+    let scratch = Scratch::new("target");
+    for command in ["inspect", "bench", "preview"] {
+        let output = run(rwm(&scratch)
+            .arg(command)
+            .arg(scratch.0.join("missing.txt")));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("path does not exist"));
+    }
+    let file = scratch.0.join("file.txt");
+    fs::write(&file, b"x").unwrap();
+    let output = run(rwm(&scratch).args(["inspect", "--background"]).arg(&file));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--background needs a folder"));
 }
+
+#[test]
+fn probe_worker_json_contract() {
+    let scratch = Scratch::new("probe");
+    let output = run(rwm(&scratch).args(["__probe-worker", "sleep", "--sleep-ms", "1"]));
+    assert!(output.status.success());
+    assert_eq!(json(&output)["slept_ms"], 1);
+}
+
+#[test]
+fn doctor_warns_actionably_on_legacy_v01_config() {
+    let scratch = Scratch::new("legacy_doctor");
+    fs::write(
+        scratch.0.join("config.toml"),
+        "[appearance]\ntheme = 'dark'\n",
+    )
+    .unwrap();
+    let output = run(rwm(&scratch).args(["doctor", "--json"]));
+    let report = json(&output);
+    let checks = report["checks"].as_array().unwrap();
+    let cfg = checks.iter().find(|c| c["name"] == "Config").unwrap();
+    assert!(cfg["ok"].as_bool().unwrap());
+    assert!(cfg["warning"].as_bool().unwrap());
+    assert!(cfg["detail"]
+        .as_str()
+        .unwrap()
+        .contains("rwm config reset"));
+}
+
+#[allow(dead_code)]
+fn _path(_: &Path) {}

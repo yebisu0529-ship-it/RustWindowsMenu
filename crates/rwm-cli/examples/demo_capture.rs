@@ -1,61 +1,54 @@
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::ffi::c_void;
 use std::fs;
-use std::io::Write;
+use std::marker::PhantomData;
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use rwm_core::config::RwmConfig;
-use rwm_core::engine::FastMenuEngine;
-use rwm_core::model::SelectionTarget;
-use rwm_ui::popup::{show_popup_menu, PopupOptions};
+use rwm_core::shell::{enable_dark_mode_menus, NativeMenu, OleGuard};
 use serde::Serialize;
-use windows::core::{w, Interface, PCWSTR};
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+use windows::core::w;
+use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetStockObject, InvalidateRect, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-    DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_SWISS, HBRUSH, HGDIOBJ, NULL_BRUSH,
-    OUT_DEFAULT_PRECIS, PS_SOLID, TRANSPARENT,
-};
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_SWISS, HBRUSH, HDC, HGDIOBJ,
+    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Shell::{
-    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent, SHParseDisplayName,
-    CMF_EXPLORE, CMF_NORMAL,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, EndMenu, EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, KillTimer, PeekMessageW, PostMessageW,
-    RegisterClassExW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TrackPopupMenuEx, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HMENU, MSG,
-    PM_REMOVE, SMTO_ABORTIFHUNG, SW_SHOW, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
-    WM_CANCELMODE, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NCCREATE,
-    WM_NULL, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EndMenu, EnumWindows,
+    GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+    KillTimer, PeekMessageW, PostMessageW, RegisterClassExW, SendMessageTimeoutW,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    GWLP_USERDATA, MSG, PM_REMOVE, SMTO_ABORTIFHUNG, SW_SHOW, WM_CANCELMODE, WM_NULL, WM_PAINT,
+    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 #[link(name = "user32")]
 extern "system" {
-    fn PrintWindow(hwnd: HWND, hdc: windows::Win32::Graphics::Gdi::HDC, flags: u32) -> BOOL;
+    fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> BOOL;
 }
 
 const W: i32 = 640;
-const H: i32 = 720;
-const ANCHOR_DX: i32 = 205;
-const ANCHOR_DY: i32 = 108;
+const H: i32 = 740;
+const ANCHOR_DX: i32 = 190;
+const ANCHOR_DY: i32 = 104;
+const TIMER_CAPTURE: usize = 98;
+const TIMER_END_MENU: usize = 99;
+const WM_PRINT: u32 = 0x0317;
+const PRF_CHECKVISIBLE: isize = 0x01;
+const PRF_NONCLIENT: isize = 0x02;
+const PRF_CLIENT: isize = 0x04;
+const PRF_ERASEBKGND: isize = 0x08;
+const PRF_CHILDREN: isize = 0x10;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DemoMode {
@@ -63,61 +56,112 @@ enum DemoMode {
     Rwm,
 }
 
-struct AppState {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Waiting,
+    Holding,
+    Released,
+}
+
+struct CaptureCollector {
+    pid: u32,
+    origin: (i32, i32),
+    t_origin: Instant,
+    release_us: u64,
+    frames: Vec<Vec<u8>>,
+    samples: Vec<(f64, i32, i32, i32, i32, usize)>,
+}
+
+struct WindowState {
     mode: DemoMode,
     file_name: String,
-    clicked: bool,
+    phase: Phase,
     status_line: String,
-    active_cm2: RefCell<Option<IContextMenu2>>,
-    active_cm3: RefCell<Option<IContextMenu3>>,
+    menu: *const NativeMenu,
+    collector: Option<CaptureCollector>,
+}
+
+struct Window(HWND);
+impl Drop for Window {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetWindowLongPtrW(self.0, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+struct MenuBindingGuard<'a>(&'a mut WindowState, PhantomData<&'a NativeMenu>);
+impl<'a> MenuBindingGuard<'a> {
+    fn bind(state: &'a mut WindowState, menu: &'a NativeMenu) -> Self {
+        state.menu = menu as *const NativeMenu;
+        Self(state, PhantomData)
+    }
+}
+impl Drop for MenuBindingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.menu = std::ptr::null();
+    }
 }
 
 struct Args {
     mode: DemoMode,
     file: PathBuf,
+    background: bool,
+    warm: bool,
     x: i32,
     y: i32,
     hold_ms: u32,
+    button_hold_ms: u32,
     record_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
+    let mut parsed = Args {
+        mode: DemoMode::Rwm,
+        file: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"),
+        background: false,
+        warm: true,
+        x: 120,
+        y: 40,
+        hold_ms: 1600,
+        button_hold_ms: 100,
+        record_dir: None,
+    };
     let mut args = std::env::args().skip(1);
-    let mut mode = DemoMode::Rwm;
-    let mut file = PathBuf::from(r"M:\Tools\RustWindowsMenu\Cargo.toml");
-    let mut x = 120;
-    let mut y = 60;
-    let mut hold_ms = 1600;
-    let mut record_dir = None;
-
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--mode" => match args.next().as_deref() {
-                Some("windows") => mode = DemoMode::Windows,
-                Some("rwm") => mode = DemoMode::Rwm,
-                other => panic!("unknown --mode {other:?}"),
-            },
-            "--file" => file = PathBuf::from(args.next().expect("missing --file")),
-            "--x" => x = args.next().expect("missing --x").parse().unwrap(),
-            "--y" => y = args.next().expect("missing --y").parse().unwrap(),
-            "--hold-ms" => hold_ms = args.next().expect("missing --hold-ms").parse().unwrap(),
-            "--record-dir" => record_dir = Some(PathBuf::from(args.next().expect("missing --record-dir"))),
-            other => panic!("unexpected argument {other}"),
+            "--background" => {
+                parsed.background = true;
+                continue;
+            }
+            "--cold" => {
+                parsed.warm = false;
+                continue;
+            }
+            _ => {}
+        }
+        let value = args
+            .next()
+            .unwrap_or_else(|| panic!("missing value for {arg}"));
+        match arg.as_str() {
+            "--mode" => {
+                parsed.mode = match value.as_str() {
+                    "windows" => DemoMode::Windows,
+                    "rwm" => DemoMode::Rwm,
+                    _ => panic!("--mode must be windows or rwm"),
+                };
+            }
+            "--file" => parsed.file = value.into(),
+            "--x" => parsed.x = value.parse().unwrap(),
+            "--y" => parsed.y = value.parse().unwrap(),
+            "--hold-ms" => parsed.hold_ms = value.parse().unwrap(),
+            "--button-hold-ms" => parsed.button_hold_ms = value.parse().unwrap(),
+            "--record-dir" => parsed.record_dir = Some(value.into()),
+            _ => panic!("unexpected argument {arg}"),
         }
     }
-
-    Args {
-        mode,
-        file,
-        x,
-        y,
-        hold_ms,
-        record_dir,
-    }
-}
-
-fn wide_null(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
+    parsed
 }
 
 fn make_font(height: i32, weight: i32) -> HGDIOBJ {
@@ -144,7 +188,7 @@ fn make_font(height: i32, weight: i32) -> HGDIOBJ {
     }
 }
 
-fn fill_solid(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, rgb: u32) {
+fn fill_solid(hdc: HDC, rect: &RECT, rgb: u32) {
     unsafe {
         let brush = CreateSolidBrush(COLORREF(rgb));
         FillRect(hdc, rect, brush);
@@ -152,87 +196,36 @@ fn fill_solid(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, rgb: u32) {
     }
 }
 
-fn draw_text(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    font: HGDIOBJ,
-    text: &str,
-    rect: &mut RECT,
-    rgb: u32,
-) {
+fn draw_text(hdc: HDC, font: HGDIOBJ, text: &str, rect: &mut RECT, rgb: u32, right_align: bool) {
     unsafe {
         let old = SelectObject(hdc, font);
         SetTextColor(hdc, COLORREF(rgb));
         let mut units: Vec<u16> = text.encode_utf16().collect();
-        DrawTextW(hdc, &mut units, rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        let align = if right_align { DT_RIGHT } else { DT_LEFT };
+        DrawTextW(hdc, &mut units, rect, align | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, old);
     }
 }
 
-fn paint_backdrop(hwnd: HWND, state: &AppState) {
-    use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+fn paint_backdrop_dc(hdc: HDC, state: &WindowState) {
     unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        if hdc.is_invalid() {
-            return;
-        }
-        paint_backdrop_dc(hdc, state);
-        let _ = EndPaint(hwnd, &ps);
-    }
-}
-
-fn paint_backdrop_dc(hdc: windows::Win32::Graphics::Gdi::HDC, state: &AppState) {
-    unsafe {
-        // GDI COLORREF is 0x00BBGGRR
-        let bg_dark = 0x001B1818;
-        let header_bg = 0x00272220;
-        let border_col = 0x003F3A36;
-        let row_bg = if state.clicked { 0x0038302A } else { 0x002A2523 };
+        let bg_dark = 0x001B_1818;
+        let header_bg = 0x0027_2220;
+        let border_col = 0x003F_3A36;
+        let row_bg = match state.phase {
+            Phase::Waiting => 0x002A_2523,
+            Phase::Holding => 0x0032_2D2A,
+            Phase::Released => 0x0038_302A,
+        };
         let accent = match state.mode {
-            DemoMode::Windows => 0x004444EF, // coral-red (#EF4444)
-            DemoMode::Rwm => 0x0081B910,     // emerald (#10B981)
+            DemoMode::Windows => 0x0044_44EF,
+            DemoMode::Rwm => 0x0081_B910,
         };
 
-        fill_solid(
-            hdc,
-            &RECT {
-                left: 0,
-                top: 0,
-                right: W,
-                bottom: H,
-            },
-            bg_dark,
-        );
-        fill_solid(
-            hdc,
-            &RECT {
-                left: 0,
-                top: 0,
-                right: W,
-                bottom: 66,
-            },
-            header_bg,
-        );
-        fill_solid(
-            hdc,
-            &RECT {
-                left: 0,
-                top: 0,
-                right: W,
-                bottom: 4,
-            },
-            accent,
-        );
-        fill_solid(
-            hdc,
-            &RECT {
-                left: 0,
-                top: 66,
-                right: W,
-                bottom: 67,
-            },
-            border_col,
-        );
+        fill_solid(hdc, &RECT { left: 0, top: 0, right: W, bottom: H }, bg_dark);
+        fill_solid(hdc, &RECT { left: 0, top: 0, right: W, bottom: 68 }, header_bg);
+        fill_solid(hdc, &RECT { left: 0, top: 0, right: W, bottom: 4 }, accent);
+        fill_solid(hdc, &RECT { left: 0, top: 68, right: W, bottom: 69 }, border_col);
 
         SetBkMode(hdc, TRANSPARENT);
         let title_font = make_font(22, 700);
@@ -242,124 +235,51 @@ fn paint_backdrop_dc(hdc: windows::Win32::Graphics::Gdi::HDC, state: &AppState) 
 
         let (title, sub) = match state.mode {
             DemoMode::Windows => (
-                "Windows Classic Menu (Standard)",
-                "Synchronous COM QueryContextMenu on UI Thread",
+                "Stock Windows 11 Classic Menu",
+                "Builds synchronously on release + fade animation",
             ),
             DemoMode::Rwm => (
-                "RustWindowsMenu (Rust + Direct2D)",
-                "Stage 0 Instant Cache + Async STA COM Hydration",
+                "RustWindowsMenu v0.2.0 (Time-Shifted Native)",
+                "Prebuilt during hold + TPM_NOANIMATION (100% OS / MSIX / COM)",
             ),
         };
-        draw_text(
-            hdc,
-            title_font,
-            title,
-            &mut RECT {
-                left: 20,
-                top: 10,
-                right: W - 20,
-                bottom: 36,
-            },
-            0x00FAFAFA,
-        );
-        draw_text(
-            hdc,
-            sub_font,
-            sub,
-            &mut RECT {
-                left: 20,
-                top: 36,
-                right: W - 20,
-                bottom: 58,
-            },
-            0x00B4B4B0,
-        );
+        draw_text(hdc, title_font, title, &mut RECT { left: 20, top: 10, right: W - 20, bottom: 38 }, 0x00FA_FAFA, false);
+        draw_text(hdc, sub_font, sub, &mut RECT { left: 20, top: 38, right: W - 20, bottom: 62 }, 0x00B4_B4B0, false);
 
-        // Explorer-like selected file row
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(border_col));
+        let row_border = if state.phase == Phase::Waiting { border_col } else { accent };
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(row_border));
         let brush = CreateSolidBrush(COLORREF(row_bg));
         let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
         let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-        let _ = RoundRect(hdc, 24, 84, W - 24, 124, 8, 8);
+        let _ = RoundRect(hdc, 20, 82, W - 20, 126, 8, 8);
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(HGDIOBJ(brush.0));
         let _ = DeleteObject(HGDIOBJ(pen.0));
 
-        draw_text(
-            hdc,
-            row_font,
-            &state.file_name,
-            &mut RECT {
-                left: 42,
-                top: 84,
-                right: 360,
-                bottom: 124,
-            },
-            0x00F4F4F5,
-        );
-        draw_text(
-            hdc,
-            sub_font,
-            "TOML Source File",
-            &mut RECT {
-                left: 440,
-                top: 84,
-                right: W - 36,
-                bottom: 124,
-            },
-            0x009CA3AF,
-        );
+        fill_solid(hdc, &RECT { left: 34, top: 92, right: 54, bottom: 116 }, 0x00FF_AA44);
+        draw_text(hdc, row_font, &state.file_name, &mut RECT { left: 66, top: 88, right: W - 210, bottom: 120 }, 0x00F4_F4F5, false);
 
-        // Bright sync marker inside (186..206, 98..112) when right-clicked!
-        if state.clicked {
-            // Vivid cyan (#00E5FF -> COLORREF 0x00FFE500)
-            fill_solid(
-                hdc,
-                &RECT {
-                    left: 186,
-                    top: 96,
-                    right: 206,
-                    bottom: 112,
-                },
-                0x00FFE500,
-            );
-            let ring_pen = CreatePen(PS_SOLID, 2, COLORREF(0x00FFE500));
-            let null_brush: HBRUSH = HBRUSH(GetStockObject(NULL_BRUSH).0);
-            let op = SelectObject(hdc, HGDIOBJ(ring_pen.0));
-            let ob = SelectObject(hdc, HGDIOBJ(null_brush.0));
-            let _ = RoundRect(hdc, 180, 90, 294, 118, 6, 6);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(HGDIOBJ(ring_pen.0));
+        let null_brush = HBRUSH(GetStockObject(NULL_BRUSH).0);
+        let ring = CreatePen(PS_SOLID, 2, COLORREF(accent));
+        let op = SelectObject(hdc, HGDIOBJ(ring.0));
+        let ob = SelectObject(hdc, HGDIOBJ(null_brush.0));
+        let _ = RoundRect(hdc, ANCHOR_DX - 8, ANCHOR_DY - 8, ANCHOR_DX + 8, ANCHOR_DY + 8, 16, 16);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(HGDIOBJ(ring.0));
 
-            draw_text(
-                hdc,
-                badge_font,
-                "CLICK!",
-                &mut RECT {
-                    left: 212,
-                    top: 90,
-                    right: 292,
-                    bottom: 118,
-                },
-                0x00FFE500,
-            );
+        let badge = match state.phase {
+            Phase::Waiting => None,
+            Phase::Holding => Some(("HOLDING (100 ms)", 0x0000_C4FF)),
+            Phase::Released => Some(("RELEASED -> POP!", 0x0081_B910)),
+        };
+        if let Some((text, col)) = badge {
+            draw_text(hdc, badge_font, text, &mut RECT { left: W - 210, top: 90, right: W - 32, bottom: 118 }, col, true);
         }
 
         if !state.status_line.is_empty() {
-            draw_text(
-                hdc,
-                sub_font,
-                &state.status_line,
-                &mut RECT {
-                    left: 24,
-                    top: H - 38,
-                    right: W - 24,
-                    bottom: H - 10,
-                },
-                0x00D4D4D8,
-            );
+            draw_text(hdc, sub_font, &state.status_line, &mut RECT { left: 20, top: H - 34, right: W - 20, bottom: H - 8 }, 0x00D4_D4D8, false);
         }
 
         let _ = DeleteObject(badge_font);
@@ -369,7 +289,18 @@ fn paint_backdrop_dc(hdc: windows::Win32::Graphics::Gdi::HDC, state: &AppState) 
     }
 }
 
-fn render_backdrop_bgra(state: &AppState) -> Vec<u8> {
+fn paint_backdrop(hwnd: HWND, state: &WindowState) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if !hdc.is_invalid() {
+            paint_backdrop_dc(hdc, state);
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+}
+
+fn render_backdrop_bgra(state: &WindowState) -> Vec<u8> {
     unsafe {
         let hdc = CreateCompatibleDC(None);
         let info = BITMAPINFO {
@@ -399,44 +330,45 @@ fn render_backdrop_bgra(state: &AppState) -> Vec<u8> {
 
 struct EnumTarget {
     pid: u32,
-    class_name: &'static str,
     found: Vec<HWND>,
 }
 
-unsafe extern "system" fn collect_matching_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if !IsWindowVisible(hwnd).as_bool() {
-        return TRUE;
-    }
-    let target = &mut *(lparam.0 as *mut EnumTarget);
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid != target.pid {
-        return TRUE;
-    }
-    let mut cls = [0u16; 128];
-    let len = GetClassNameW(hwnd, &mut cls);
-    if len > 0 && String::from_utf16_lossy(&cls[..len as usize]) == target.class_name {
-        target.found.push(hwnd);
-    }
+unsafe extern "system" fn collect_menu_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let target = &mut *(lparam.0 as *mut EnumTarget);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != target.pid {
+            return TRUE;
+        }
+        let mut cls = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut cls);
+        if len > 0 && String::from_utf16_lossy(&cls[..len as usize]) == "#32768" {
+            target.found.push(hwnd);
+        }
+        TRUE
+    }));
     TRUE
 }
 
-fn find_own_menu_window(class_name: &'static str) -> Option<HWND> {
-    let mut state = EnumTarget {
-        pid: unsafe { GetCurrentProcessId() },
-        class_name,
+fn find_own_menu_window(pid: u32) -> Option<HWND> {
+    let mut target = EnumTarget {
+        pid,
         found: Vec::new(),
     };
     unsafe {
         let _ = EnumWindows(
-            Some(collect_matching_window),
-            LPARAM(&mut state as *mut EnumTarget as isize),
+            Some(collect_menu_window),
+            LPARAM(&mut target as *mut EnumTarget as isize),
         );
     }
-    state.found.into_iter().next()
+    target.found.into_iter().next()
 }
 
-fn capture_menu_window(hwnd: HWND, use_print_window: bool) -> Option<(i32, i32, i32, i32, Vec<u8>)> {
+fn capture_popup_window(hwnd: HWND) -> Option<(i32, i32, i32, i32, Vec<u8>)> {
     let mut rc = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut rc) }.is_err() {
         return None;
@@ -444,21 +376,6 @@ fn capture_menu_window(hwnd: HWND, use_print_window: bool) -> Option<(i32, i32, 
     let w = rc.right - rc.left;
     let h = rc.bottom - rc.top;
     if w <= 0 || h <= 0 {
-        return None;
-    }
-    let mut res = 0usize;
-    let alive = unsafe {
-        SendMessageTimeoutW(
-            hwnd,
-            WM_NULL,
-            WPARAM(0),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG,
-            15,
-            Some(&mut res),
-        )
-    };
-    if alive.0 == 0 {
         return None;
     }
     unsafe {
@@ -477,31 +394,19 @@ fn capture_menu_window(hwnd: HWND, use_print_window: bool) -> Option<(i32, i32, 
         };
         let mut bits = std::ptr::null_mut();
         let Ok(bmp) = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
-            let _ = DeleteDC(hdc);
+            let _ = DeleteDC(mem_dc_fallback(hdc));
             return None;
-        };
-        if bits.is_null() {
-            let _ = DeleteObject(HGDIOBJ(bmp.0));
-            let _ = DeleteDC(hdc);
-            return None;
-        }
-        let old = SelectObject(hdc, HGDIOBJ(bmp.0));
-        let ok = if use_print_window {
-            PrintWindow(hwnd, hdc, 2).as_bool()
-        } else {
-            SendMessageTimeoutW(
-                hwnd,
-                0x0318, // WM_PRINTCLIENT
-                WPARAM(hdc.0 as usize),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG,
-                40,
-                Some(&mut res),
-            )
-            .0 != 0
         };
         let mut out = None;
-        if ok {
+        if !bits.is_null() {
+            let old = SelectObject(hdc, HGDIOBJ(bmp.0));
+            // Same-thread `WM_PRINT` renders full menu item hierarchy without partial cross-thread abort.
+            let _ = SendMessageW(
+                hwnd,
+                WM_PRINT,
+                WPARAM(hdc.0 as usize),
+                LPARAM(PRF_CHECKVISIBLE | PRF_NONCLIENT | PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN),
+            );
             let len = (w * h * 4) as usize;
             let bytes = std::slice::from_raw_parts(bits.cast::<u8>(), len).to_vec();
             let u32_pixels = std::slice::from_raw_parts(bits.cast::<u32>(), (w * h) as usize);
@@ -512,15 +417,31 @@ fn capture_menu_window(hwnd: HWND, use_print_window: bool) -> Option<(i32, i32, 
                     break;
                 }
             }
-            if distinct.len() > 4 {
+            if distinct.len() <= 4 {
+                let _ = PrintWindow(hwnd, hdc, 0);
+                let bytes = std::slice::from_raw_parts(bits.cast::<u8>(), len).to_vec();
+                let u32_pixels = std::slice::from_raw_parts(bits.cast::<u32>(), (w * h) as usize);
+                let mut d2 = HashSet::new();
+                for &px in u32_pixels.iter().step_by(3) {
+                    d2.insert(px);
+                    if d2.len() > 4 {
+                        out = Some((rc.left, rc.top, w, h, bytes));
+                        break;
+                    }
+                }
+            } else {
                 out = Some((rc.left, rc.top, w, h, bytes));
             }
+            SelectObject(hdc, old);
         }
-        SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DeleteDC(hdc);
         out
     }
+}
+
+unsafe fn mem_dc_fallback(hdc: HDC) -> HDC {
+    hdc
 }
 
 #[derive(Serialize)]
@@ -538,69 +459,15 @@ struct RecordingMeta {
     mode: String,
     w: i32,
     h: i32,
+    query_ms: f64,
+    items: usize,
     first_menu_ms: Option<f64>,
-    metric_label: String,
-    get_ui_ms: Option<f64>,
-    query_ms: Option<f64>,
-    total_ms: Option<f64>,
-    stage0_us: Option<u64>,
-    hydrated_groups: Option<usize>,
-    final_item_count: Option<usize>,
-    rendered_with_d2d: Option<bool>,
+    hold_ms: u32,
     samples: Vec<RecordedSample>,
 }
 
-struct RecordedBuffers {
-    frames: Vec<Vec<u8>>,
-    samples: Vec<(f64, i32, i32, i32, i32, usize)>,
-}
-
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if msg == WM_NCCREATE {
-        let cs = &*(lparam.0 as *const CREATESTRUCTW);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState;
-    if !ptr.is_null()
-        && matches!(
-            msg,
-            WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
-        )
-    {
-        let st = &*ptr;
-        if let Some(ref cm3) = *st.active_cm3.borrow() {
-            let mut lr = LRESULT::default();
-            if cm3.HandleMenuMsg2(msg, wparam, lparam, Some(&mut lr)).is_ok() {
-                return lr;
-            }
-        }
-        if let Some(ref cm2) = *st.active_cm2.borrow() {
-            if cm2.HandleMenuMsg(msg, wparam, lparam).is_ok() {
-                return LRESULT(0);
-            }
-        }
-    }
-    if msg == WM_PAINT && !ptr.is_null() {
-        paint_backdrop(hwnd, &*ptr);
-        return LRESULT(0);
-    }
-    if msg == WM_TIMER && wparam.0 == 99 {
-        let _ = KillTimer(hwnd, 99);
-        let _ = EndMenu();
-        let _ = PostMessageW(hwnd, WM_CANCELMODE, WPARAM(0), LPARAM(0));
-        return LRESULT(0);
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
 fn pump_for(ms: u64) {
-    let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+    let deadline = Instant::now() + Duration::from_millis(ms);
     let mut msg = MSG::default();
     while Instant::now() < deadline {
         unsafe {
@@ -609,199 +476,96 @@ fn pump_for(ms: u64) {
                 DispatchMessageW(&msg);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(4));
     }
 }
 
-fn trigger_windows_menu(
+unsafe extern "system" fn window_proc(
     hwnd: HWND,
-    state: &AppState,
-    file: &Path,
-    anchor: (i32, i32),
-    hold_ms: u32,
-) -> (f64, f64, f64) {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let t0 = Instant::now();
-
-        let wide_path = wide_null(&file.to_string_lossy());
-        let mut pidl = std::ptr::null_mut();
-        SHParseDisplayName(PCWSTR(wide_path.as_ptr()), None, &mut pidl, 0, None)
-            .expect("SHParseDisplayName");
-        let mut child = std::ptr::null_mut();
-        let folder: IShellFolder = SHBindToParent(pidl, Some(&mut child)).expect("SHBindToParent");
-        let cm: IContextMenu = folder
-            .GetUIObjectOf(hwnd, &[child.cast_const()], None)
-            .expect("GetUIObjectOf(IContextMenu)");
-        CoTaskMemFree(Some(pidl.cast()));
-        let get_ui_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        *state.active_cm3.borrow_mut() = cm.cast::<IContextMenu3>().ok();
-        *state.active_cm2.borrow_mut() = cm.cast::<IContextMenu2>().ok();
-
-        let hmenu: HMENU = CreatePopupMenu().expect("CreatePopupMenu");
-        let t1 = Instant::now();
-        cm.QueryContextMenu(hmenu, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXPLORE)
-            .expect("QueryContextMenu");
-        let query_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        SetTimer(hwnd, 99, hold_ms, None);
-        let hwnd_val = hwnd.0 as usize;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64 + 120));
-            let _ = PostMessageW(HWND(hwnd_val as *mut _), WM_CANCELMODE, WPARAM(0), LPARAM(0));
-        });
-
-        let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenuEx(
-            hmenu,
-            (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY | TPM_RETURNCMD).0,
-            anchor.0,
-            anchor.1,
-            hwnd,
-            None,
-        );
-        *state.active_cm3.borrow_mut() = None;
-        *state.active_cm2.borrow_mut() = None;
-        let _ = DestroyMenu(hmenu);
-        drop(cm);
-        CoUninitialize();
-
-        (get_ui_ms, query_ms, total_ms)
-    }
-}
-
-fn trigger_rwm_menu(
-    hwnd: HWND,
-    engine: &FastMenuEngine,
-    target: SelectionTarget,
-    anchor: (i32, i32),
-    hold_ms: u32,
-) -> (u64, usize, usize, bool) {
-    let snapshot = engine.build_instant_snapshot(target, false);
-    let session_id = snapshot.session_id;
-    let stage0_us = snapshot.stage0_us;
-
-    let result = show_popup_menu(
-        engine,
-        snapshot,
-        PopupOptions {
-            anchor,
-            owner_hwnd: hwnd,
-            show_timings: true,
-            submenu_hover_delay_ms: 140,
-            smoke_test_ms: Some(hold_ms),
-        },
-    );
-    engine.close_session(session_id);
-
-    (
-        stage0_us,
-        result.hydrated_groups,
-        result.final_item_count,
-        result.rendered_with_d2d,
-    )
-}
-
-fn spawn_recorder(
-    mode: DemoMode,
-    origin_pos: (i32, i32),
-    t_origin: Instant,
-    click_us: Arc<AtomicU64>,
-    stop_flag: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<RecordedBuffers> {
-    let class_name = match mode {
-        DemoMode::Windows => "#32768",
-        DemoMode::Rwm => "RustWindowsMenuPopup",
-    };
-    let use_print_window = mode == DemoMode::Windows;
-    std::thread::spawn(move || {
-        let mut frames: Vec<Vec<u8>> = Vec::new();
-        let mut samples: Vec<(f64, i32, i32, i32, i32, usize)> = Vec::new();
-        while !stop_flag.load(Ordering::Acquire) {
-            let cu = click_us.load(Ordering::Acquire);
-            if cu == u64::MAX {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            if let Some(hm) = find_own_menu_window(class_name) {
-                if let Some((left, top, w, h, bytes)) = capture_menu_window(hm, use_print_window) {
-                    let now_us = t_origin.elapsed().as_micros() as u64;
-                    let rel_ms = (now_us.saturating_sub(cu)) as f64 / 1000.0;
-                    let file_idx = match frames.last() {
-                        Some(prev) if *prev == bytes => frames.len() - 1,
-                        _ => {
-                            frames.push(bytes);
-                            frames.len() - 1
-                        }
-                    };
-                    samples.push((
-                        rel_ms,
-                        left - origin_pos.0,
-                        top - origin_pos.1,
-                        w,
-                        h,
-                        file_idx,
-                    ));
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let handled = catch_unwind(AssertUnwindSafe(|| {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+        if !state.is_null() {
+            let menu = (*state).menu;
+            if !menu.is_null() {
+                if let Some(result) = (*menu).handle_menu_msg(message, wparam, lparam) {
+                    return Some(result);
                 }
             }
-            let elapsed_after_click_ms = (t_origin.elapsed().as_micros() as u64)
-                .saturating_sub(cu)
-                / 1000;
-            let step_ms = if elapsed_after_click_ms < 120 { 3 } else { 14 };
-            std::thread::sleep(std::time::Duration::from_millis(step_ms));
+            if message == WM_PAINT {
+                paint_backdrop(hwnd, &*state);
+                return Some(LRESULT(0));
+            }
+            if message == WM_TIMER && wparam.0 == TIMER_CAPTURE {
+                if let Some(ref mut col) = (*state).collector {
+                    if let Some(hm) = find_own_menu_window(col.pid) {
+                        if let Some((left, top, w, h, bytes)) = capture_popup_window(hm) {
+                            let now_us = col.t_origin.elapsed().as_micros() as u64;
+                            let rel_ms = (now_us as f64 - col.release_us as f64) / 1000.0;
+                            let file_idx = match col.frames.last() {
+                                Some(prev) if *prev == bytes => col.frames.len() - 1,
+                                _ => {
+                                    col.frames.push(bytes);
+                                    col.frames.len() - 1
+                                }
+                            };
+                            col.samples.push((
+                                rel_ms,
+                                left - col.origin.0,
+                                top - col.origin.1,
+                                w,
+                                h,
+                                file_idx,
+                            ));
+                        }
+                    }
+                }
+                return Some(LRESULT(0));
+            }
         }
-        RecordedBuffers { frames, samples }
-    })
+        if message == WM_TIMER && wparam.0 == TIMER_END_MENU {
+            let _ = KillTimer(hwnd, TIMER_END_MENU);
+            let _ = KillTimer(hwnd, TIMER_CAPTURE);
+            let _ = EndMenu();
+            return Some(LRESULT(0));
+        }
+        None
+    }))
+    .ok()
+    .flatten();
+    handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam))
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
+    if let Some(dir) = &args.record_dir {
+        fs::create_dir_all(dir)?;
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-
-    let target = SelectionTarget::from_path(&args.file, false);
-    let rwm_engine = if args.mode == DemoMode::Rwm {
-        let mut cfg = RwmConfig::load_or_default().unwrap_or_default();
-        cfg.appearance.show_timings = true;
-        let engine = FastMenuEngine::new(Arc::new(cfg), false);
-        let warm = engine.build_instant_snapshot(target.clone(), false);
-        engine.close_session(warm.session_id);
-        Some(engine)
-    } else {
-        None
+    enable_dark_mode_menus();
+    let _ole = OleGuard::initialize()?;
+    let instance = unsafe { GetModuleHandleW(None)? };
+    let class = w!("RustWindowsMenuDemoV02");
+    let wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(window_proc),
+        hInstance: HINSTANCE::from(instance),
+        lpszClassName: class,
+        ..Default::default()
     };
-
-    let mut state = Box::new(AppState {
-        mode: args.mode,
-        file_name: args
-            .file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| args.file.display().to_string()),
-        clicked: false,
-        status_line: "Waiting for right-click...".to_string(),
-        active_cm2: RefCell::new(None),
-        active_cm3: RefCell::new(None),
-    });
-
-    let hwnd = unsafe {
-        let hinst = GetModuleHandleW(None).unwrap();
-        let cls = w!("RustWindowsMenuDemoBackdrop");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: hinst.into(),
-            lpszClassName: cls,
-            ..Default::default()
-        };
+    unsafe {
         RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
+    }
+    let owner = Window(unsafe {
+        CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            cls,
-            w!("RustWindowsMenu Demo"),
+            class,
+            w!("RustWindowsMenu v0.2 Demo"),
             WS_POPUP,
             args.x,
             args.y,
@@ -809,104 +573,163 @@ fn main() {
             H,
             None,
             None,
-            hinst,
-            Some((&*state as *const AppState) as *const c_void),
-        )
-        .expect("CreateWindowExW");
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = UpdateWindow(hwnd);
-        hwnd
-    };
+            instance,
+            None,
+        )?
+    });
+    let file_name = args
+        .file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| args.file.display().to_string());
+    let mut state = Box::new(WindowState {
+        mode: args.mode,
+        file_name,
+        phase: Phase::Waiting,
+        status_line: "Waiting for right-click...".into(),
+        menu: std::ptr::null(),
+        collector: None,
+    });
+    unsafe {
+        SetWindowLongPtrW(owner.0, GWLP_USERDATA, (&mut *state as *mut WindowState) as isize);
+        let _ = ShowWindow(owner.0, SW_SHOW);
+        let _ = UpdateWindow(owner.0);
+    }
+
+    if args.warm {
+        let _ = NativeMenu::build_from_paths(
+            owner.0,
+            std::slice::from_ref(&args.file),
+            args.background,
+            false,
+        )?;
+    }
 
     if let Some(ref dir) = args.record_dir {
-        fs::create_dir_all(dir).expect("create record-dir");
-        fs::write(dir.join("idle_bg.bgra"), render_backdrop_bgra(&state)).expect("write idle_bg");
+        fs::write(dir.join("idle_bg.bgra"), render_backdrop_bgra(&state))?;
     }
 
     let t_origin = Instant::now();
-    let click_us = Arc::new(AtomicU64::new(u64::MAX));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let recorder = args.record_dir.as_ref().map(|_| {
-        spawn_recorder(
-            args.mode,
-            (args.x, args.y),
-            t_origin,
-            Arc::clone(&click_us),
-            Arc::clone(&stop_flag),
-        )
-    });
+    pump_for(200);
 
-    pump_for(700);
+    let press_origin_us = t_origin.elapsed().as_micros() as u64;
+    let scheduled_release_us = press_origin_us + u64::from(args.button_hold_ms) * 1000;
 
-    // Paint vivid click sync marker and immediately trigger real menu.
-    state.clicked = true;
+    state.phase = Phase::Holding;
     state.status_line = match args.mode {
-        DemoMode::Windows => "Right-clicked! Blocking UI thread on COM QueryContextMenu...".to_string(),
-        DemoMode::Rwm => "Right-clicked! Stage 0 open -> hydrating COM asynchronously...".to_string(),
+        DemoMode::Windows => "Right-button pressed (holding 100 ms)...".into(),
+        DemoMode::Rwm => "Button pressed -> 15 ms arm -> prebuilding menu during hold...".into(),
     };
     unsafe {
-        let _ = InvalidateRect(hwnd, None, false);
-        let _ = UpdateWindow(hwnd);
+        let _ = InvalidateRect(owner.0, None, false);
+        let _ = UpdateWindow(owner.0);
+        let _ = SetForegroundWindow(owner.0);
     }
     if let Some(ref dir) = args.record_dir {
-        fs::write(dir.join("clicked_bg.bgra"), render_backdrop_bgra(&state))
-            .expect("write clicked_bg");
+        fs::write(dir.join("holding_bg.bgra"), render_backdrop_bgra(&state))?;
     }
 
     let anchor = (args.x + ANCHOR_DX, args.y + ANCHOR_DY);
-    click_us.store(t_origin.elapsed().as_micros() as u64, Ordering::Release);
-    println!("EVENT click");
-    let _ = std::io::stdout().flush();
-
-    let mut win_stats = None;
-    let mut rwm_stats = None;
-    match args.mode {
-        DemoMode::Windows => {
-            win_stats = Some(trigger_windows_menu(
-                hwnd,
-                &state,
-                &args.file,
-                anchor,
-                args.hold_ms,
-            ));
-        }
+    let press_start = Instant::now();
+    let hold = Duration::from_millis(u64::from(args.button_hold_ms));
+    let (actual_release_us, menu) = match args.mode {
         DemoMode::Rwm => {
-            let engine = rwm_engine.as_ref().expect("engine initialized");
-            rwm_stats = Some(trigger_rwm_menu(
-                hwnd,
-                engine,
-                target,
-                anchor,
-                args.hold_ms,
-            ));
-            engine.shutdown();
+            pump_for(15);
+            let menu = NativeMenu::build_from_paths(
+                owner.0,
+                std::slice::from_ref(&args.file),
+                args.background,
+                false,
+            )?;
+            let elapsed = press_start.elapsed();
+            if elapsed < hold {
+                pump_for((hold - elapsed).as_millis() as u64);
+            }
+            (scheduled_release_us, menu)
         }
+        DemoMode::Windows => {
+            pump_for(u64::from(args.button_hold_ms));
+            let rel = t_origin.elapsed().as_micros() as u64;
+            state.phase = Phase::Released;
+            state.status_line = "Released -> running QueryContextMenu synchronously...".into();
+            unsafe {
+                let _ = InvalidateRect(owner.0, None, false);
+                let _ = UpdateWindow(owner.0);
+            }
+            let menu = NativeMenu::build_from_paths(
+                owner.0,
+                std::slice::from_ref(&args.file),
+                args.background,
+                false,
+            )?;
+            (rel, menu)
+        }
+    };
+
+    state.phase = Phase::Released;
+    state.status_line = match args.mode {
+        DemoMode::Windows => "Menu ready after synchronous block -> fading in...".into(),
+        DemoMode::Rwm => "Released -> instant TrackPopupMenuEx(TPM_NOANIMATION)!".into(),
+    };
+    unsafe {
+        let _ = InvalidateRect(owner.0, None, false);
+        let _ = UpdateWindow(owner.0);
+    }
+    if let Some(ref dir) = args.record_dir {
+        fs::write(dir.join("clicked_bg.bgra"), render_backdrop_bgra(&state))?;
+        state.collector = Some(CaptureCollector {
+            pid: unsafe { GetCurrentProcessId() },
+            origin: (args.x, args.y),
+            t_origin,
+            release_us: actual_release_us,
+            frames: Vec::new(),
+            samples: Vec::new(),
+        });
     }
 
-    stop_flag.store(true, Ordering::Release);
-    let recorded = recorder.map(|h| h.join().expect("recorder thread"));
+    let query_ms = menu.build_us() as f64 / 1000.0;
+    let items = menu.root_item_count();
+    let has_collector = state.collector.is_some();
+    {
+        let _binding = MenuBindingGuard::bind(&mut state, &menu);
+        let hwnd_val = owner.0 .0 as usize;
+        let close_ms = u64::from(args.hold_ms);
+        unsafe {
+            if has_collector {
+                let _ = SetTimer(owner.0, TIMER_CAPTURE, 16, None);
+            }
+            let _ = SetTimer(owner.0, TIMER_END_MENU, args.hold_ms, None);
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(close_ms + 120));
+            let _ = unsafe { PostMessageW(HWND(hwnd_val as *mut _), WM_CANCELMODE, WPARAM(0), LPARAM(0)) };
+        });
+        let no_animation = args.mode == DemoMode::Rwm;
+        let _ = menu.track_and_invoke(owner.0, anchor, no_animation)?;
+        let _ = unsafe { PostMessageW(owner.0, WM_NULL, WPARAM(0), LPARAM(0)) };
+    }
+
+    let recorded = state.collector.take();
     let first_menu_ms = recorded
         .as_ref()
         .and_then(|r| r.samples.first().map(|s| s.0));
 
-    if let Some((get_ui_ms, query_ms, total_ms)) = win_stats {
-        println!(
-            "RESULT mode=windows get_ui_ms={get_ui_ms:.3} query_ms={query_ms:.3} total_ms={total_ms:.3} first_menu_ms={:.3}",
-            first_menu_ms.unwrap_or(total_ms)
-        );
-    }
-    if let Some((stage0_us, hydrated_groups, final_item_count, rendered_with_d2d)) = rwm_stats {
-        println!(
-            "RESULT mode=rwm stage0_us={stage0_us} hydrated_groups={hydrated_groups} final_item_count={final_item_count} rendered_with_d2d={rendered_with_d2d} first_menu_ms={:.3}",
-            first_menu_ms.unwrap_or(0.0)
-        );
-    }
+    println!(
+        "RESULT mode={} query_ms={:.3} items={} first_menu_ms={:.3}",
+        match args.mode {
+            DemoMode::Windows => "windows",
+            DemoMode::Rwm => "rwm",
+        },
+        query_ms,
+        items,
+        first_menu_ms.unwrap_or(query_ms)
+    );
 
     if let (Some(ref dir), Some(rec)) = (&args.record_dir, recorded) {
         let mut frame_names = Vec::with_capacity(rec.frames.len());
         for (i, bytes) in rec.frames.iter().enumerate() {
             let name = format!("frame_{i:04}.bgra");
-            fs::write(dir.join(&name), bytes).expect("write recorded frame");
+            fs::write(dir.join(&name), bytes)?;
             frame_names.push(name);
         }
         let samples = rec
@@ -923,43 +746,20 @@ fn main() {
             .collect();
         let meta = RecordingMeta {
             mode: match args.mode {
-                DemoMode::Windows => "windows".to_string(),
-                DemoMode::Rwm => "rwm".to_string(),
+                DemoMode::Windows => "windows".into(),
+                DemoMode::Rwm => "rwm".into(),
             },
             w: W,
             h: H,
+            query_ms,
+            items,
             first_menu_ms,
-            metric_label: match win_stats {
-                Some((_, _, total_ms)) => format!("{total_ms:.0} ms COM block"),
-                None => match rwm_stats {
-                    Some((stage0_us, _, _, _)) => {
-                        format!("{stage0_us} us ({:.3} ms) Stage 0", stage0_us as f64 / 1000.0)
-                    }
-                    None => String::new(),
-                },
-            },
-            get_ui_ms: win_stats.map(|v| v.0),
-            query_ms: win_stats.map(|v| v.1),
-            total_ms: win_stats.map(|v| v.2),
-            stage0_us: rwm_stats.map(|v| v.0),
-            hydrated_groups: rwm_stats.map(|v| v.1),
-            final_item_count: rwm_stats.map(|v| v.2),
-            rendered_with_d2d: rwm_stats.map(|v| v.3),
+            hold_ms: args.button_hold_ms,
             samples,
         };
-        let json = serde_json::to_string_pretty(&meta).expect("serialize meta");
-        fs::write(dir.join("meta.json"), json).expect("write meta.json");
+        fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
     }
 
-    state.clicked = false;
-    state.status_line = "Done".to_string();
-    unsafe {
-        let _ = InvalidateRect(hwnd, None, false);
-        let _ = UpdateWindow(hwnd);
-    }
-    pump_for(200);
-
-    unsafe {
-        let _ = DestroyWindow(hwnd);
-    }
+    let _ = unsafe { SendMessageTimeoutW(owner.0, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 50, None) };
+    Ok(())
 }

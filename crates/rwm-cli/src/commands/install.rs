@@ -1,884 +1,943 @@
 use std::fs;
 use std::io;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
-use rwm_core::classic::{self, ClassicRegistryScope};
-use rwm_core::config::RwmConfig;
+use rwm_core::build_info::{versioned_dll_filename, ABI_VERSION, BUILD_ID};
+use rwm_core::{classic, handlers};
+use serde::{Deserialize, Serialize};
 
-use super::classic::{disable as disable_classic, enable as enable_classic, AppliedClassic};
 use crate::cli::{InstallArgs, UninstallArgs};
 use crate::error::{CliError, CliResult, Context};
-use crate::explorer::{self, DetachDelivery, ShellWindow};
-use crate::hookdll::{self, HOOK_DLL_FILE};
-use crate::host::{self, StopOutcome, HOST_EVENT_NAME};
-use crate::output::print;
+use crate::hookdll;
+use crate::host;
+use crate::output::print_line;
 use crate::reg;
 
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "RustWindowsMenu";
+pub const ENVIRONMENT_KEY: &str = "Environment";
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
-const INSTALLED_EXE: &str = "rwm.exe";
-const HOST_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Suffix of an installed file that was in use during an upgrade and renamed out of the way.
-const SET_ASIDE_SUFFIX: &str = "old";
-/// Suffix of a file that was in use during an uninstall and moved out of the bin folder.
-const LEFTOVER_SUFFIX: &str = "removed";
-
-/// Every place an installation touches. Tests point all of it at scratch locations.
-pub struct InstallEnv {
-    pub classic: ClassicRegistryScope,
-    /// Whether classic-menu changes are announced to the shell. Off for scratch scopes.
-    pub notify_shell: bool,
-    pub bin_dir: PathBuf,
-    /// HKCU subkey that holds the autostart value.
-    pub run_key: String,
-    pub host_event: String,
-    /// The running `rwm.exe`, which is the file that gets installed.
-    pub exe: PathBuf,
-    pub hook_dll: Option<PathBuf>,
-    /// Creates the default config when there is none. Returns its path and whether it was
-    /// created.
-    pub ensure_config: fn() -> CliResult<(PathBuf, bool)>,
-    pub explorer_windows: fn() -> Vec<ShellWindow>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CurrentMetadata {
+    pub build_id: String,
+    pub abi_version: u32,
+    pub hook_dll: PathBuf,
 }
 
-fn ensure_default_config() -> CliResult<(PathBuf, bool)> {
-    Ok(RwmConfig::write_default_if_missing()?)
+pub struct InstallEnv {
+    pub root: PathBuf,
+    pub source_exe: PathBuf,
+    pub source_host: PathBuf,
+    pub source_dll: Option<PathBuf>,
+    pub run_key: String,
+    pub environment_key: String,
+    pub validate_dll: fn(&Path) -> CliResult<()>,
+    pub stop_hosts: fn() -> CliResult<()>,
+    pub start_host: fn(&Path) -> CliResult<()>,
+    pub restore_classic: fn() -> CliResult<bool>,
+    pub restore_handlers: fn() -> CliResult<usize>,
+    pub broadcast_environment: bool,
+    pub ensure_config: fn() -> CliResult<()>,
+}
+
+fn validate_live_dll(path: &Path) -> CliResult<()> {
+    let probe = hookdll::probe(path);
+    if probe.is_usable() {
+        Ok(())
+    } else {
+        Err(CliError::new(format!(
+            "source hook DLL validation failed: {}",
+            probe.problems.join("; ")
+        )))
+    }
+}
+fn stop_live_hosts() -> CliResult<()> {
+    host::stop().map(|_| ())
+}
+fn restore_live_classic() -> CliResult<bool> {
+    if classic::status()?.has_backup {
+        classic::disable(false)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+fn restore_live_handlers() -> CliResult<usize> {
+    Ok(handlers::restore_rwm_blocks()?)
+}
+fn ensure_live_config() -> CliResult<()> {
+    if !rwm_core::config::config_path().exists() {
+        rwm_core::config::RwmConfig::default().save()?;
+    }
+    Ok(())
 }
 
 impl InstallEnv {
     pub fn live() -> CliResult<Self> {
-        let exe = std::env::current_exe()
-            .context(|| "cannot locate the running executable".to_string())?;
+        let exe = std::env::current_exe().context(|| "cannot locate rwm.exe".to_string())?;
+        let root = std::env::var_os("RWM_INSTALL_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(rwm_core::config::local_data_dir);
         Ok(Self {
-            classic: ClassicRegistryScope::live(),
-            notify_shell: true,
-            bin_dir: RwmConfig::local_data_dir().join("bin"),
-            run_key: RUN_KEY.to_string(),
-            host_event: HOST_EVENT_NAME.to_string(),
-            hook_dll: hookdll::locate(&exe),
-            exe,
-            ensure_config: ensure_default_config,
-            explorer_windows: explorer::enumerate_explorer_windows,
+            root,
+            source_host: exe.with_file_name("rwm-host.exe"),
+            source_dll: hookdll::locate(&exe),
+            source_exe: exe,
+            run_key: RUN_KEY.into(),
+            environment_key: ENVIRONMENT_KEY.into(),
+            validate_dll: validate_live_dll,
+            stop_hosts: stop_live_hosts,
+            start_host: host::start_host_exe,
+            restore_classic: restore_live_classic,
+            restore_handlers: restore_live_handlers,
+            broadcast_environment: true,
+            ensure_config: ensure_live_config,
         })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileOutcome {
-    Copied,
-    /// The source already is the installed file: `rwm install` ran from the bin folder.
-    AlreadyInPlace,
-    /// The old file was in use, so it was renamed aside and the new one put in its place.
-    ReplacedInUse,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledFile {
-    pub path: PathBuf,
-    pub outcome: FileOutcome,
+    fn bin(&self) -> PathBuf {
+        self.root.join("bin")
+    }
 }
 
 #[derive(Debug)]
 pub struct InstallReport {
-    pub classic: AppliedClassic,
-    pub config_path: PathBuf,
-    pub config_created: bool,
-    /// Empty with `--classic-only`.
-    pub files: Vec<InstalledFile>,
-    pub autostart: Option<String>,
+    pub root: PathBuf,
+    pub started: bool,
+    pub startup_registered: bool,
+    pub path_updated: bool,
+    pub cleanup_pending: Vec<PathBuf>,
+}
+#[derive(Debug)]
+pub struct UninstallReport {
+    pub root: PathBuf,
+    pub classic_restored: bool,
+    pub handlers_restored: usize,
+    pub cleanup_pending: Vec<PathBuf>,
 }
 
-/// What `rwm install` was asked to set up. `--classic-only` installs no files, so there is
-/// nothing for an autostart entry to start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallMode {
-    ClassicOnly,
-    Full { autostart: bool },
+fn is_reparse_or_link(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
-impl From<&InstallArgs> for InstallMode {
-    fn from(args: &InstallArgs) -> Self {
-        if args.classic_only {
-            Self::ClassicOnly
-        } else {
-            Self::Full {
-                autostart: args.autostart,
-            }
-        }
-    }
-}
-
-/// The Run-key command line: the quoted path of the installed `rwm.exe`, then `run --hidden`.
-pub fn autostart_command(installed_exe: &Path) -> String {
-    format!("\"{}\" run --hidden", installed_exe.display())
-}
-
-pub fn install_with(env: &InstallEnv, mode: InstallMode) -> CliResult<InstallReport> {
-    // Checked first so a missing DLL stops the install before anything has changed.
-    let hook_dll = match mode {
-        InstallMode::ClassicOnly => None,
-        InstallMode::Full { .. } => Some(env.hook_dll.as_deref().ok_or_else(|| {
-            CliError::new(format!(
-                "{} To switch on only the classic menu, use `rwm install --classic-only`.",
-                hookdll::not_found_error(&env.exe)
-            ))
-        })?),
-    };
-
-    let classic = enable_classic(&env.classic, true, false, env.notify_shell)?;
-    let (config_path, config_created) = (env.ensure_config)()?;
-    let files = match hook_dll {
-        Some(dll) => install_files(&env.exe, dll, &env.bin_dir)?,
-        None => Vec::new(),
-    };
-    let autostart = if mode == (InstallMode::Full { autostart: true }) {
-        let command = autostart_command(&env.bin_dir.join(INSTALLED_EXE));
-        reg::write_string(&env.run_key, RUN_VALUE, &command)
-            .context(|| format!(r"cannot write HKCU\{}\{RUN_VALUE}", env.run_key))?;
-        Some(command)
+fn require_file(path: &Path, label: &str) -> CliResult<()> {
+    if path.is_file() && fs::metadata(path)?.len() > 0 {
+        Ok(())
     } else {
-        None
-    };
-
-    Ok(InstallReport {
-        classic,
-        config_path,
-        config_created,
-        files,
-        autostart,
-    })
-}
-
-fn install_files(exe: &Path, hook_dll: &Path, bin_dir: &Path) -> CliResult<Vec<InstalledFile>> {
-    fs::create_dir_all(bin_dir).context(|| format!("cannot create {}", bin_dir.display()))?;
-    remove_files_with_suffix(bin_dir, SET_ASIDE_SUFFIX);
-    if let Some(data_dir) = bin_dir.parent() {
-        remove_files_with_suffix(data_dir, LEFTOVER_SUFFIX);
-    }
-
-    [(exe, INSTALLED_EXE), (hook_dll, HOOK_DLL_FILE)]
-        .into_iter()
-        .map(|(source, name)| {
-            let path = bin_dir.join(name);
-            let outcome = install_file(source, &path)
-                .context(|| format!("cannot copy {} to {}", source.display(), path.display()))?;
-            Ok(InstalledFile { path, outcome })
-        })
-        .collect()
-}
-
-fn install_file(source: &Path, destination: &Path) -> io::Result<FileOutcome> {
-    if is_same_file(source, destination) {
-        return Ok(FileOutcome::AlreadyInPlace);
-    }
-    let Err(copy_error) = fs::copy(source, destination) else {
-        return Ok(FileOutcome::Copied);
-    };
-    if !destination.exists() {
-        return Err(copy_error);
-    }
-
-    // The destination is a running rwm.exe or a hook DLL still mapped into Explorer. Windows
-    // refuses to overwrite such a file but allows renaming it, and whoever has it open keeps
-    // using the renamed copy.
-    let aside = sibling_with_suffix(destination, SET_ASIDE_SUFFIX);
-    fs::rename(destination, &aside)?;
-    if let Err(err) = fs::copy(source, destination) {
-        let _ = fs::rename(&aside, destination);
-        return Err(err);
-    }
-    Ok(FileOutcome::ReplacedInUse)
-}
-
-fn is_same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+        Err(CliError::new(format!(
+            "{label} is missing or empty: {}",
+            path.display()
+        )))
     }
 }
 
-/// `rwm.exe` becomes `rwm.exe.<pid>.<suffix>` in `directory`.
-fn renamed_into(directory: &Path, file: &Path, suffix: &str) -> PathBuf {
-    let name = file
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    directory.join(format!("{name}.{}.{suffix}", std::process::id()))
+fn unique_pending(root: &Path, path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    root.join("cleanup_pending")
+        .join(format!("{name}.{}", std::process::id()))
 }
 
-fn sibling_with_suffix(file: &Path, suffix: &str) -> PathBuf {
-    renamed_into(file.parent().unwrap_or(Path::new(".")), file, suffix)
+struct Replacement {
+    destination: PathBuf,
+    backup: Option<PathBuf>,
 }
 
-/// Deletes what earlier runs had to rename out of the way. Files still in use stay.
-fn remove_files_with_suffix(directory: &Path, suffix: &str) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for path in entries.flatten().map(|entry| entry.path()) {
-        if path.extension().is_some_and(|ext| ext == suffix) {
+struct StagedGuard(Vec<PathBuf>);
+impl StagedGuard {
+    fn disarm(&mut self) {
+        self.0.clear();
+    }
+}
+impl Drop for StagedGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
             let _ = fs::remove_file(path);
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Removal {
-    NotInstalled,
-    Removed,
-    /// The folder is gone, but these files were in use and could only be moved next to it.
-    RemovedWithLeftovers(Vec<PathBuf>),
-    Failed(String),
+fn strip_motw(path: &Path) {
+    let mut zone = path.as_os_str().to_os_string();
+    zone.push(":Zone.Identifier");
+    let _ = fs::remove_file(PathBuf::from(zone));
 }
 
-/// What uninstall did about the classic context menu.
-#[derive(Debug)]
-pub enum ClassicStep {
-    /// `--keep-classic` was given.
-    Kept,
-    /// rwm holds no backup, so it never switched the classic menu on here. Whatever state
-    /// the menu is in was set by something else and is not rwm's to undo.
-    NothingToRestore,
-    Restored(AppliedClassic),
-    Failed(String),
-}
-
-#[derive(Debug)]
-pub struct UninstallReport {
-    /// Whether an autostart value existed and was deleted.
-    pub autostart_removed: Result<bool, String>,
-    pub host: StopOutcome,
-    /// `None` when no Explorer window was open to receive the detach message.
-    pub detach: Option<DetachDelivery>,
-    pub files: Removal,
-    pub classic: ClassicStep,
-}
-
-impl UninstallReport {
-    pub fn succeeded(&self) -> bool {
-        self.autostart_removed.is_ok()
-            && self.host != StopOutcome::TimedOut
-            && !matches!(self.files, Removal::Failed(_))
-            && !matches!(self.classic, ClassicStep::Failed(_))
+fn stage(source: &Path, destination: &Path) -> CliResult<PathBuf> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let staged = destination.with_extension(format!("new.{}", std::process::id()));
+    fs::copy(source, &staged)
+        .context(|| format!("cannot stage {} to {}", source.display(), staged.display()))?;
+    strip_motw(&staged);
+    Ok(staged)
 }
 
-/// Runs every step even when an earlier one fails, so one locked file or registry error
-/// does not leave the rest of the installation behind.
-pub fn uninstall_with(env: &InstallEnv, args: &UninstallArgs) -> UninstallReport {
-    let autostart_removed =
-        reg::delete_value(&env.run_key, RUN_VALUE).map_err(|err| err.to_string());
-
-    // A running host keeps rwm.exe and the hook DLL open, and it detaches cleanly on request.
-    let host = host::stop_running_host(&env.host_event, HOST_STOP_TIMEOUT);
-
-    // Covers a hook DLL that outlived its host, for example after the host was killed.
-    let windows = (env.explorer_windows)();
-    let detach = (!windows.is_empty())
-        .then(|| explorer::send_detach(&windows, explorer::detach_message_id()));
-
-    let files = remove_bin_dir(&env.bin_dir);
-    let classic = if args.keep_classic {
-        ClassicStep::Kept
+fn commit(staged: &Path, destination: &Path) -> CliResult<Replacement> {
+    let backup = if destination.exists() {
+        let backup = destination.with_extension(format!("rollback.{}", std::process::id()));
+        fs::rename(destination, &backup)
+            .context(|| format!("cannot preserve {}", destination.display()))?;
+        Some(backup)
     } else {
-        restore_classic(env)
+        None
     };
-
-    UninstallReport {
-        autostart_removed,
-        host,
-        detach,
-        files,
-        classic,
-    }
-}
-
-/// Puts the classic menu back the way `classic::enable` found it. The backup that `enable`
-/// writes is the proof that rwm made the change. Without it, `classic::disable` would delete
-/// a classic-menu setting the user made on their own.
-fn restore_classic(env: &InstallEnv) -> ClassicStep {
-    match classic::status(&env.classic) {
-        Err(err) => ClassicStep::Failed(err.to_string()),
-        Ok(status) if !status.has_backup => ClassicStep::NothingToRestore,
-        Ok(_) => match disable_classic(&env.classic, false, env.notify_shell) {
-            Ok(applied) => ClassicStep::Restored(applied),
-            Err(err) => ClassicStep::Failed(err.to_string()),
-        },
-    }
-}
-
-fn remove_bin_dir(bin_dir: &Path) -> Removal {
-    let data_dir = bin_dir.parent().unwrap_or(Path::new("."));
-    remove_files_with_suffix(data_dir, LEFTOVER_SUFFIX);
-    if !bin_dir.exists() {
-        return Removal::NotInstalled;
-    }
-    if fs::remove_dir_all(bin_dir).is_ok() {
-        return Removal::Removed;
-    }
-
-    // What is left is in use: this very rwm.exe when it runs from the bin folder, or a hook
-    // DLL that Explorer has not unloaded yet. Such a file cannot be deleted, but it can be
-    // moved, which lets the folder go now and the file on a later run.
-    let entries = match fs::read_dir(bin_dir) {
-        Ok(entries) => entries,
-        Err(err) => return Removal::Failed(format!("cannot read {}: {err}", bin_dir.display())),
-    };
-    let mut leftovers = Vec::new();
-    for path in entries.flatten().map(|entry| entry.path()) {
-        if fs::remove_file(&path).is_ok() {
-            continue;
+    if let Err(error) = fs::rename(staged, destination) {
+        if let Some(backup) = &backup {
+            let _ = fs::rename(backup, destination);
         }
-        let moved = renamed_into(data_dir, &path, LEFTOVER_SUFFIX);
-        if let Err(err) = fs::rename(&path, &moved) {
-            return Removal::Failed(format!(
-                "{} is in use and cannot be deleted or moved: {err}",
-                path.display()
-            ));
-        }
-        leftovers.push(moved);
+        return Err(CliError::new(format!(
+            "cannot install {}: {error}",
+            destination.display()
+        )));
     }
-    match fs::remove_dir(bin_dir) {
-        Ok(()) if leftovers.is_empty() => Removal::Removed,
-        Ok(()) => Removal::RemovedWithLeftovers(leftovers),
-        Err(err) => Removal::Failed(format!("cannot remove {}: {err}", bin_dir.display())),
-    }
-}
-
-/// `rwm install`.
-pub fn install(args: &InstallArgs) -> CliResult<ExitCode> {
-    let env = InstallEnv::live()?;
-    let report = install_with(&env, InstallMode::from(args))?;
-    print(&render_install(&report));
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `rwm uninstall`.
-pub fn uninstall(args: &UninstallArgs) -> CliResult<ExitCode> {
-    let env = InstallEnv::live()?;
-    let report = uninstall_with(&env, args);
-    let config_path = RwmConfig::config_path();
-    let kept_config = config_path.exists().then_some(config_path.as_path());
-    print(&render_uninstall(&report, &env.bin_dir, kept_config));
-    Ok(if report.succeeded() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    Ok(Replacement {
+        destination: destination.to_path_buf(),
+        backup,
     })
 }
 
-fn render_install(report: &InstallReport) -> String {
-    let mut text = report.classic.render(true);
-    let config = report.config_path.display();
-    if report.config_created {
-        text.push_str(&format!("Config: created the default at {config}\n"));
-    } else {
-        text.push_str(&format!("Config: kept {config}\n"));
-    }
-    for file in &report.files {
-        let path = file.path.display();
-        text.push_str(&match file.outcome {
-            FileOutcome::Copied => format!("Installed {path}\n"),
-            FileOutcome::AlreadyInPlace => format!("Already installed: {path}\n"),
-            FileOutcome::ReplacedInUse => format!(
-                "Installed {path} (the old copy is still mapped in Explorer; restart \
-                 explorer.exe before starting the updated hook host)\n"
-            ),
-        });
-    }
-    if let Some(command) = &report.autostart {
-        text.push_str(&format!("Autostart at sign-in: {command}\n"));
-    }
-
-    if let Some(installed_exe) = report.files.first() {
-        text.push_str(&format!(
-            "\nStart the menu accelerator with: \"{}\" run\n",
-            installed_exe.path.display()
-        ));
-    }
-    text
-}
-
-fn render_uninstall(
-    report: &UninstallReport,
-    bin_dir: &Path,
-    kept_config: Option<&Path>,
-) -> String {
-    let mut text = String::new();
-    text.push_str(&match &report.autostart_removed {
-        Ok(true) => "Autostart entry removed.\n".to_string(),
-        Ok(false) => "No autostart entry was set.\n".to_string(),
-        Err(err) => format!("FAILED to remove the autostart entry: {err}\n"),
-    });
-    text.push_str(match report.host {
-        StopOutcome::NotRunning => "No hook host was running.\n",
-        StopOutcome::Stopped => "The running hook host detached and exited.\n",
-        StopOutcome::TimedOut => {
-            "FAILED: the running hook host did not exit in time. Run `rwm stop` (or press Ctrl+C \
-             in its console) and run `rwm uninstall` again.\n"
-        }
-    });
-    text.push_str(&match report.detach {
-        Some(delivery) => format!(
-            "Detach message acknowledged by {} of {} Explorer windows.\n",
-            delivery.delivered, delivery.windows
-        ),
-        None => "No Explorer window is open, so no detach message was sent.\n".to_string(),
-    });
-
-    let bin = bin_dir.display();
-    text.push_str(&match &report.files {
-        Removal::NotInstalled => format!("Nothing is installed at {bin}.\n"),
-        Removal::Removed => format!("Removed {bin}\n"),
-        Removal::RemovedWithLeftovers(leftovers) => {
-            let mut lines = format!("Removed {bin}\n");
-            for leftover in leftovers {
-                lines.push_str(&format!(
-                    "  A file was in use and has been moved to {}. Delete it after signing \
-                     out, or let the next `rwm install` or `rwm uninstall` remove it.\n",
-                    leftover.display()
+fn rollback(replacements: Vec<Replacement>) -> Vec<String> {
+    let mut errors = Vec::new();
+    for replacement in replacements.into_iter().rev() {
+        if let Err(error) = fs::remove_file(&replacement.destination) {
+            if error.kind() != io::ErrorKind::NotFound {
+                errors.push(format!(
+                    "remove {}: {error}",
+                    replacement.destination.display()
                 ));
             }
-            lines
         }
-        Removal::Failed(err) => format!("FAILED to remove {bin}: {err}\n"),
-    });
-    text.push_str(&match &report.classic {
-        ClassicStep::Kept => {
-            "The classic context menu was left as it is (--keep-classic).\n".to_string()
+        if let Some(backup) = replacement.backup {
+            if let Err(error) = fs::rename(&backup, &replacement.destination) {
+                errors.push(format!(
+                    "restore {} from {}: {error}",
+                    replacement.destination.display(),
+                    backup.display()
+                ));
+            }
         }
-        ClassicStep::NothingToRestore => {
-            "The classic context menu was not switched on by rwm, so it was left as it is. \
-             `rwm classic disable` turns it off.\n"
-                .to_string()
-        }
-        ClassicStep::Restored(applied) => applied.render(false),
-        ClassicStep::Failed(err) => format!("FAILED to restore the classic menu state: {err}\n"),
-    });
-    if let Some(config) = kept_config {
-        text.push_str(&format!("Your config was kept: {}\n", config.display()));
     }
-    text
+    errors
+}
+
+fn finish(replacements: Vec<Replacement>, root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut pending = Vec::new();
+    let mut errors = Vec::new();
+    for replacement in replacements {
+        if let Some(backup) = replacement.backup {
+            move_or_delete_file(root, &backup, &mut pending, &mut errors);
+        }
+    }
+    (pending, errors)
+}
+
+fn move_or_delete_file(
+    root: &Path,
+    path: &Path,
+    pending: &mut Vec<PathBuf>,
+    errors: &mut Vec<String>,
+) {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            errors.push(format!("{}: {error}", path.display()));
+            return;
+        }
+    };
+    if is_reparse_or_link(&meta) || meta.is_dir() {
+        return;
+    }
+    if let Err(remove_error) = fs::remove_file(path) {
+        let destination = unique_pending(root, path);
+        match fs::create_dir_all(destination.parent().unwrap())
+            .and_then(|()| fs::rename(path, &destination))
+        {
+            Ok(()) => pending.push(destination),
+            Err(move_error) => errors.push(format!(
+                "{}: delete failed ({remove_error}); move to cleanup_pending failed ({move_error})",
+                path.display()
+            )),
+        }
+    }
+}
+
+fn remove_empty_dir_non_reparse(dir: &Path) {
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !is_reparse_or_link(&meta) && meta.is_dir() {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+fn is_rwm_version_file(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with("rwm_hook") && (name.ends_with(".dll") || name.contains(".dll."))
+}
+
+fn sweep_cleanup_pending(root: &Path) {
+    let dir = root.join("cleanup_pending");
+    let Ok(meta) = fs::symlink_metadata(&dir) else {
+        return;
+    };
+    if is_reparse_or_link(&meta) || !meta.is_dir() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(item_meta) = fs::symlink_metadata(&path) {
+                if !is_reparse_or_link(&item_meta) && item_meta.is_file() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    remove_empty_dir_non_reparse(&dir);
+}
+
+fn cleanup_old_versions(env: &InstallEnv) -> (Vec<PathBuf>, Vec<String>) {
+    let versions = env.root.join("versions");
+    let mut pending = Vec::new();
+    let mut errors = Vec::new();
+    let Ok(versions_meta) = fs::symlink_metadata(&versions) else {
+        return (pending, errors);
+    };
+    if is_reparse_or_link(&versions_meta) || !versions_meta.is_dir() {
+        return (pending, errors);
+    }
+    let Ok(entries) = fs::read_dir(&versions) else {
+        return (pending, errors);
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == BUILD_ID {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if is_reparse_or_link(&meta) || !meta.is_dir() {
+            continue;
+        }
+        if let Ok(files) = fs::read_dir(&dir) {
+            for file in files.flatten() {
+                if is_rwm_version_file(&file.file_name()) {
+                    move_or_delete_file(&env.root, &file.path(), &mut pending, &mut errors);
+                }
+            }
+        }
+        remove_empty_dir_non_reparse(&dir);
+    }
+    (pending, errors)
+}
+
+fn rollback_registry_updates(
+    env: &InstallEnv,
+    startup_changed: bool,
+    prev_run: Option<&str>,
+    path_changed: bool,
+) {
+    if startup_changed {
+        let _ = match prev_run {
+            Some(prev) => reg::write_string(&env.run_key, RUN_VALUE, prev),
+            None => reg::delete_value(&env.run_key, RUN_VALUE).map(|_| ()),
+        };
+    }
+    if path_changed
+        && reg::update_user_path_in_key(&env.environment_key, &env.bin(), true).unwrap_or(false)
+        && env.broadcast_environment
+    {
+        broadcast_environment();
+    }
+}
+
+pub fn install_with(env: &InstallEnv, args: &InstallArgs) -> CliResult<InstallReport> {
+    require_file(&env.source_exe, "rwm.exe")?;
+    require_file(&env.source_host, "rwm-host.exe")?;
+    let dll = env
+        .source_dll
+        .as_deref()
+        .ok_or_else(|| CliError::new("matching hook DLL was not found"))?;
+    require_file(dll, "hook DLL")?;
+    (env.validate_dll)(dll)?;
+
+    let bin = env.bin();
+    let version_dir = env.root.join("versions").join(BUILD_ID);
+    let mut staged_guard = StagedGuard(Vec::new());
+    let staged_exe = stage(&env.source_exe, &bin.join("rwm.exe"))?;
+    staged_guard.0.push(staged_exe.clone());
+    let staged_host = stage(&env.source_host, &bin.join("rwm-host.exe"))?;
+    staged_guard.0.push(staged_host.clone());
+    let staged_dll = stage(dll, &version_dir.join(versioned_dll_filename()))?;
+    staged_guard.0.push(staged_dll.clone());
+    let metadata = serde_json::to_vec_pretty(&CurrentMetadata {
+        build_id: BUILD_ID.into(),
+        abi_version: ABI_VERSION,
+        hook_dll: version_dir.join(versioned_dll_filename()),
+    })?;
+    let current = env.root.join("current.json");
+    let staged_current = current.with_extension(format!("new.{}", std::process::id()));
+    fs::write(&staged_current, metadata)?;
+    staged_guard.0.push(staged_current.clone());
+
+    let had_previous_host = bin.join("rwm-host.exe").is_file();
+    (env.stop_hosts)()?;
+    let mut replacements = Vec::new();
+    for (staged, destination) in [
+        (&staged_dll, version_dir.join(versioned_dll_filename())),
+        (&staged_exe, bin.join("rwm.exe")),
+        (&staged_host, bin.join("rwm-host.exe")),
+        (&staged_current, current.clone()),
+    ] {
+        match commit(staged, &destination) {
+            Ok(replacement) => replacements.push(replacement),
+            Err(error) => {
+                let rollback_errs = rollback(replacements);
+                let prev_note = if had_previous_host && !args.no_start {
+                    match (env.start_host)(&bin.join("rwm-host.exe")) {
+                        Ok(()) => "; previous host restarted",
+                        Err(_) => "; previous host could not be restarted",
+                    }
+                } else {
+                    ""
+                };
+                return Err(CliError::new(if rollback_errs.is_empty() {
+                    format!("{error}{prev_note}")
+                } else {
+                    format!(
+                        "{error}{prev_note}; rollback warnings: {}",
+                        rollback_errs.join("; ")
+                    )
+                }));
+            }
+        }
+    }
+    staged_guard.disarm();
+
+    let fail_with_rollback = |cause: String,
+                              replacements: Vec<Replacement>,
+                              startup_changed: bool,
+                              prev_run: Option<&str>,
+                              path_changed: bool| {
+        rollback_registry_updates(env, startup_changed, prev_run, path_changed);
+        let rollback_errs = rollback(replacements);
+        let restart_note = if had_previous_host && !args.no_start {
+            match (env.start_host)(&bin.join("rwm-host.exe")) {
+                Ok(()) => " (previous installation and host were restored)",
+                Err(_) => " (previous files restored, but previous host could not be restarted)",
+            }
+        } else {
+            " (previous installation was restored)"
+        };
+        let suffix = if rollback_errs.is_empty() {
+            String::new()
+        } else {
+            format!("; rollback warnings: {}", rollback_errs.join("; "))
+        };
+        Err(CliError::new(format!("{cause}{restart_note}{suffix}")))
+    };
+
+    if args.classic {
+        if let Err(error) = classic::enable() {
+            return fail_with_rollback(
+                format!("failed to enable classic menu override: {error}"),
+                replacements,
+                false,
+                None,
+                false,
+            );
+        }
+    }
+    if let Err(error) = (env.ensure_config)() {
+        return fail_with_rollback(
+            format!("failed to initialize configuration: {error}"),
+            replacements,
+            false,
+            None,
+            false,
+        );
+    }
+
+    let prev_run = if args.no_startup {
+        None
+    } else {
+        reg::read_string(&env.run_key, RUN_VALUE).ok().flatten()
+    };
+    let startup_registered = if args.no_startup {
+        false
+    } else {
+        let value = format!("\"{}\"", bin.join("rwm-host.exe").display());
+        if let Err(error) = reg::write_string(&env.run_key, RUN_VALUE, &value) {
+            return fail_with_rollback(
+                format!("failed to register startup entry: {error}"),
+                replacements,
+                false,
+                prev_run.as_deref(),
+                false,
+            );
+        }
+        true
+    };
+    let path_updated = if args.no_path {
+        false
+    } else {
+        match reg::update_user_path_in_key(&env.environment_key, &bin, false) {
+            Ok(changed) => {
+                if changed && env.broadcast_environment {
+                    broadcast_environment();
+                }
+                changed
+            }
+            Err(error) => {
+                return fail_with_rollback(
+                    format!("failed to update user PATH: {error}"),
+                    replacements,
+                    startup_registered,
+                    prev_run.as_deref(),
+                    false,
+                );
+            }
+        }
+    };
+    if !args.no_start {
+        if let Err(error) = (env.start_host)(&bin.join("rwm-host.exe")) {
+            return fail_with_rollback(
+                format!("installed host failed to start: {error}"),
+                replacements,
+                startup_registered,
+                prev_run.as_deref(),
+                path_updated,
+            );
+        }
+    }
+
+    let (mut pending, mut cleanup_errors) = finish(replacements, &env.root);
+    let legacy_dll = bin.join("rwm_hook.dll");
+    if legacy_dll.exists() {
+        move_or_delete_file(&env.root, &legacy_dll, &mut pending, &mut cleanup_errors);
+    }
+    let (old_pending, old_errors) = cleanup_old_versions(env);
+    pending.extend(old_pending);
+    cleanup_errors.extend(old_errors);
+    sweep_cleanup_pending(&env.root);
+    print_line(format!(
+        "Installed RustWindowsMenu {BUILD_ID} at {}",
+        env.root.display()
+    ));
+    if !cleanup_errors.is_empty() {
+        print_line(format!("Cleanup warning(s): {}", cleanup_errors.join("; ")));
+    }
+    Ok(InstallReport {
+        root: env.root.clone(),
+        started: !args.no_start,
+        startup_registered,
+        path_updated,
+        cleanup_pending: pending,
+    })
+}
+
+fn verify_install_root(root: &Path) -> CliResult<CurrentMetadata> {
+    let meta_path = root.join("current.json");
+    let meta = fs::symlink_metadata(&meta_path).map_err(|_| {
+        CliError::new(format!(
+            "{} is not a verified RustWindowsMenu install (missing current.json); refusing to delete files",
+            root.display()
+        ))
+    })?;
+    if is_reparse_or_link(&meta) || !meta.is_file() {
+        return Err(CliError::new(format!(
+            "{} is not a regular install manifest file",
+            meta_path.display()
+        )));
+    }
+    let bytes = fs::read(&meta_path)
+        .context(|| format!("cannot read install manifest {}", meta_path.display()))?;
+    serde_json::from_slice(&bytes)
+        .context(|| format!("invalid install manifest {}", meta_path.display()))
+}
+
+fn remove_owned_install_files(root: &Path, metadata: &CurrentMetadata) -> (Vec<PathBuf>, Vec<String>) {
+    let mut pending = Vec::new();
+    let mut errors = Vec::new();
+    let bin = root.join("bin");
+    for file in [
+        bin.join("rwm.exe"),
+        bin.join("rwm-host.exe"),
+        bin.join("rwm_hook.dll"),
+        bin.join(versioned_dll_filename()),
+        root.join("current.json"),
+        metadata.hook_dll.clone(),
+    ] {
+        move_or_delete_file(root, &file, &mut pending, &mut errors);
+    }
+    if let Ok(meta) = fs::symlink_metadata(&bin) {
+        if !is_reparse_or_link(&meta) && meta.is_dir() {
+            if let Ok(entries) = fs::read_dir(&bin) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("rwm.exe.")
+                        || name.starts_with("rwm-host.exe.")
+                        || is_rwm_version_file(entry.file_name().as_os_str())
+                    {
+                        move_or_delete_file(root, &entry.path(), &mut pending, &mut errors);
+                    }
+                }
+            }
+            remove_empty_dir_non_reparse(&bin);
+        }
+    }
+    let versions = root.join("versions");
+    if let Ok(meta) = fs::symlink_metadata(&versions) {
+        if !is_reparse_or_link(&meta) && meta.is_dir() {
+            if let Ok(entries) = fs::read_dir(&versions) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    let Ok(dir_meta) = fs::symlink_metadata(&dir) else {
+                        continue;
+                    };
+                    if is_reparse_or_link(&dir_meta) || !dir_meta.is_dir() {
+                        continue;
+                    }
+                    if let Ok(files) = fs::read_dir(&dir) {
+                        for file in files.flatten() {
+                            if is_rwm_version_file(&file.file_name()) {
+                                move_or_delete_file(root, &file.path(), &mut pending, &mut errors);
+                            }
+                        }
+                    }
+                    remove_empty_dir_non_reparse(&dir);
+                }
+            }
+            remove_empty_dir_non_reparse(&versions);
+        }
+    }
+    sweep_cleanup_pending(root);
+    remove_empty_dir_non_reparse(root);
+    (pending, errors)
+}
+
+pub fn uninstall_with(env: &InstallEnv, args: &UninstallArgs) -> CliResult<UninstallReport> {
+    let manifest = verify_install_root(&env.root)?;
+    (env.stop_hosts)()?;
+    reg::delete_value(&env.run_key, RUN_VALUE)?;
+    if reg::update_user_path_in_key(&env.environment_key, &env.bin(), true)?
+        && env.broadcast_environment
+    {
+        broadcast_environment();
+    }
+    let mut warnings = Vec::new();
+    let classic_restored = match (env.restore_classic)() {
+        Ok(restored) => restored,
+        Err(error) => {
+            warnings.push(format!("classic menu restore failed: {error}"));
+            false
+        }
+    };
+    let handlers_restored = match (env.restore_handlers)() {
+        Ok(count) => count,
+        Err(error) => {
+            warnings.push(format!("handler block restore failed: {error}"));
+            0
+        }
+    };
+    let (pending, mut cleanup_errors) = remove_owned_install_files(&env.root, &manifest);
+    warnings.append(&mut cleanup_errors);
+    if args.purge {
+        let config = rwm_core::config::config_dir();
+        if let Ok(meta) = fs::symlink_metadata(&config) {
+            if !is_reparse_or_link(&meta) && meta.is_dir() {
+                if let Err(error) = fs::remove_dir_all(&config) {
+                    warnings.push(format!("cannot purge {}: {error}", config.display()));
+                }
+            }
+        }
+    }
+    print_line(format!(
+        "Uninstalled {}. Restored classic state: {classic_restored}; handlers: {handlers_restored}.",
+        env.root.display()
+    ));
+    if !pending.is_empty() {
+        print_line(format!(
+            "{} mapped file(s) remain in cleanup_pending; delete them after sign-out.",
+            pending.len()
+        ));
+    }
+    if !warnings.is_empty() {
+        return Err(CliError::new(warnings.join("; ")));
+    }
+    Ok(UninstallReport {
+        root: env.root.clone(),
+        classic_restored,
+        handlers_restored,
+        cleanup_pending: pending,
+    })
+}
+
+fn broadcast_environment() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+    let mut result = 0usize;
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(w!("Environment").0 as isize),
+            SMTO_ABORTIFHUNG,
+            5000,
+            Some(&mut result),
+        );
+    }
+}
+
+pub fn install(args: &InstallArgs) -> CliResult<ExitCode> {
+    host::ensure_matching_elevation("install")?;
+    let report = install_with(&InstallEnv::live()?, args)?;
+    print_line(format!(
+        "Root: {}; started={}; startup={}; Path updated={}; pending cleanup={}",
+        report.root.display(),
+        report.started,
+        report.startup_registered,
+        report.path_updated,
+        report.cleanup_pending.len()
+    ));
+    Ok(ExitCode::SUCCESS)
+}
+pub fn uninstall(args: &UninstallArgs) -> CliResult<ExitCode> {
+    let report = uninstall_with(&InstallEnv::live()?, args)?;
+    print_line(format!(
+        "Root: {}; classic restored={}; handlers restored={}; pending cleanup={}",
+        report.root.display(),
+        report.classic_restored,
+        report.handlers_restored,
+        report.cleanup_pending.len()
+    ));
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-    use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_AS_IMAGE_RESOURCE};
-
     use super::*;
-    use crate::testutil::{unique_name, RegistryRoot, TempDir};
+    use crate::testutil::{RegistryRoot, TempDir};
 
-    /// A scratch installation: its own registry root, folders, and host event.
+    fn accept(_: &Path) -> CliResult<()> {
+        Ok(())
+    }
+    fn noop() -> CliResult<()> {
+        Ok(())
+    }
+    fn no_config() -> CliResult<()> {
+        Ok(())
+    }
+    fn start_ok(_: &Path) -> CliResult<()> {
+        Ok(())
+    }
+    fn start_fail(_: &Path) -> CliResult<()> {
+        Err(CliError::new("injected start failure"))
+    }
+    fn restored_classic() -> CliResult<bool> {
+        Ok(true)
+    }
+    fn restored_handlers() -> CliResult<usize> {
+        Ok(2)
+    }
+
     struct Sandbox {
         env: InstallEnv,
-        _registry: RegistryRoot,
+        _reg: RegistryRoot,
         _dir: TempDir,
     }
-
-    fn config_already_exists() -> CliResult<(PathBuf, bool)> {
-        Ok((PathBuf::from(r"C:\scratch\config.toml"), false))
-    }
-
-    fn sandbox(label: &str) -> Sandbox {
-        let registry = RegistryRoot::new(label);
+    fn sandbox(label: &str, start: fn(&Path) -> CliResult<()>) -> Sandbox {
         let dir = TempDir::new(label);
-        let source = dir.path().join("download");
+        let registry = RegistryRoot::new(label);
+        let source = dir.path().join("source");
         fs::create_dir(&source).unwrap();
-        fs::write(source.join("rwm-download.exe"), b"exe v1").unwrap();
-        fs::write(source.join(HOOK_DLL_FILE), b"dll v1").unwrap();
-
+        fs::write(source.join("rwm.exe"), b"new rwm").unwrap();
+        fs::write(source.join("rwm-host.exe"), b"new host").unwrap();
+        fs::write(source.join("rwm_hook.dll"), b"new dll").unwrap();
         let env = InstallEnv {
-            classic: ClassicRegistryScope::isolated(
-                registry.path(),
-                dir.path().join("data").join("classic_backup.json"),
-            ),
-            notify_shell: false,
-            bin_dir: dir.path().join("data").join("bin"),
+            root: dir.path().join("install"),
+            source_exe: source.join("rwm.exe"),
+            source_host: source.join("rwm-host.exe"),
+            source_dll: Some(source.join("rwm_hook.dll")),
             run_key: format!(r"{}\Run", registry.path()),
-            host_event: format!(r"Local\{}", unique_name(label)),
-            exe: source.join("rwm-download.exe"),
-            hook_dll: Some(source.join(HOOK_DLL_FILE)),
-            ensure_config: config_already_exists,
-            explorer_windows: Vec::new,
+            environment_key: format!(r"{}\Environment", registry.path()),
+            validate_dll: accept,
+            stop_hosts: noop,
+            start_host: start,
+            restore_classic: restored_classic,
+            restore_handlers: restored_handlers,
+            broadcast_environment: false,
+            ensure_config: no_config,
         };
         Sandbox {
             env,
-            _registry: registry,
+            _reg: registry,
             _dir: dir,
         }
     }
-
-    impl Sandbox {
-        fn classic_enabled(&self) -> bool {
-            classic::status(&self.env.classic)
-                .expect("read scratch classic state")
-                .classic_menu_enabled
+    fn flags() -> InstallArgs {
+        InstallArgs {
+            classic: false,
+            no_startup: false,
+            no_path: false,
+            no_start: false,
         }
-
-        fn autostart(&self) -> Option<String> {
-            reg::read_string(&self.env.run_key, RUN_VALUE).expect("read scratch Run key")
-        }
-    }
-
-    const FULL: InstallMode = InstallMode::Full { autostart: false };
-    const WITH_AUTOSTART: InstallMode = InstallMode::Full { autostart: true };
-    const REMOVE_ALL: UninstallArgs = UninstallArgs {
-        keep_classic: false,
-    };
-
-    /// Maps a file as an image, the way Explorer maps the hook DLL: it cannot be deleted or
-    /// overwritten while mapped, but it can be renamed. No code from the file runs.
-    struct MappedImage(HMODULE);
-
-    impl MappedImage {
-        fn map(path: &Path) -> Self {
-            let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-            let module = unsafe {
-                LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_AS_IMAGE_RESOURCE)
-            }
-            .expect("map image");
-            Self(module)
-        }
-    }
-
-    impl Drop for MappedImage {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = FreeLibrary(self.0);
-            }
-        }
-    }
-
-    fn system_image() -> PathBuf {
-        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"))
-            .join("System32")
-            .join("version.dll")
     }
 
     #[test]
-    fn install_flags_map_to_a_mode() {
-        let mode = |classic_only, autostart| {
-            InstallMode::from(&InstallArgs {
-                classic_only,
-                autostart,
-            })
+    fn install_uninstall_roundtrip_is_idempotent_in_scratch_locations() {
+        let sb = sandbox("roundtrip", start_ok);
+        install_with(&sb.env, &flags()).unwrap();
+        install_with(&sb.env, &flags()).unwrap();
+        assert!(sb.env.root.join("current.json").is_file());
+        assert!(reg::read_string(&sb.env.run_key, RUN_VALUE)
+            .unwrap()
+            .is_some());
+        assert!(reg::read_string(&sb.env.environment_key, "Path")
+            .unwrap()
+            .unwrap()
+            .contains("bin"));
+        let report = uninstall_with(&sb.env, &UninstallArgs { purge: false }).unwrap();
+        assert!(report.classic_restored);
+        assert_eq!(report.handlers_restored, 2);
+        assert!(!sb.env.bin().exists());
+        assert!(reg::read_string(&sb.env.run_key, RUN_VALUE)
+            .unwrap()
+            .is_none());
+        assert!(!reg::read_string(&sb.env.environment_key, "Path")
+            .unwrap()
+            .unwrap()
+            .contains("bin"));
+    }
+
+    #[test]
+    fn failed_host_start_rolls_back_existing_binaries_and_metadata() {
+        let mut sb = sandbox("rollback", start_ok);
+        install_with(&sb.env, &flags()).unwrap();
+        fs::write(sb.env.root.join("current.json"), b"sentinel").unwrap();
+        fs::write(sb.env.bin().join("rwm.exe"), b"old rwm").unwrap();
+        fs::write(&sb.env.source_exe, b"newer rwm").unwrap();
+        sb.env.start_host = start_fail;
+        let error = install_with(&sb.env, &flags()).unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(fs::read(sb.env.bin().join("rwm.exe")).unwrap(), b"old rwm");
+        assert_eq!(
+            fs::read(sb.env.root.join("current.json")).unwrap(),
+            b"sentinel"
+        );
+    }
+
+    #[test]
+    fn uninstall_moves_mapped_dlls_to_cleanup_pending() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::FreeLibrary;
+        use windows::Win32::System::LibraryLoader::{
+            LoadLibraryExW, LOAD_LIBRARY_AS_IMAGE_RESOURCE,
         };
-        assert_eq!(mode(false, false), FULL);
-        assert_eq!(mode(false, true), WITH_AUTOSTART);
-        assert_eq!(mode(true, false), InstallMode::ClassicOnly);
+
+        let sb = sandbox("mapped", start_ok);
+        install_with(&sb.env, &flags()).unwrap();
+        let dll = sb
+            .env
+            .root
+            .join("versions")
+            .join(BUILD_ID)
+            .join(versioned_dll_filename());
+        let system =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32\\version.dll");
+        fs::copy(system, &dll).unwrap();
+        let wide = dll.as_os_str().encode_wide().chain([0]).collect::<Vec<_>>();
+        let mapped =
+            unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_AS_IMAGE_RESOURCE) }
+                .unwrap();
+        let report = uninstall_with(&sb.env, &UninstallArgs { purge: false }).unwrap();
+        assert_eq!(report.cleanup_pending.len(), 1);
+        assert!(report.cleanup_pending[0].is_file());
+        assert!(report.cleanup_pending[0].starts_with(sb.env.root.join("cleanup_pending")));
+        unsafe {
+            FreeLibrary(mapped).unwrap();
+        }
     }
 
     #[test]
-    fn autostart_command_quotes_the_installed_exe() {
-        assert_eq!(
-            autostart_command(Path::new(
-                r"C:\Users\Jo Doe\AppData\Local\RustWindowsMenu\bin\rwm.exe"
-            )),
-            r#""C:\Users\Jo Doe\AppData\Local\RustWindowsMenu\bin\rwm.exe" run --hidden"#
-        );
+    fn missing_or_rejected_source_changes_nothing() {
+        let sb = sandbox("reject", start_fail);
+        fs::remove_file(&sb.env.source_host).unwrap();
+        assert!(install_with(&sb.env, &flags()).is_err());
+        assert!(!sb.env.root.exists());
+        assert!(reg::read_string(&sb.env.run_key, RUN_VALUE)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn install_enables_classic_copies_files_and_registers_autostart() {
-        let sb = sandbox("install_full");
-        assert!(!sb.classic_enabled());
-
-        let report = install_with(&sb.env, WITH_AUTOSTART).expect("install");
-
-        assert!(report.classic.changed);
-        assert!(sb.classic_enabled());
-        assert_eq!(report.config_path, PathBuf::from(r"C:\scratch\config.toml"));
-        assert!(!report.config_created);
-
-        let installed_exe = sb.env.bin_dir.join("rwm.exe");
-        let installed_dll = sb.env.bin_dir.join("rwm_hook.dll");
-        assert_eq!(
-            report.files,
-            vec![
-                InstalledFile {
-                    path: installed_exe.clone(),
-                    outcome: FileOutcome::Copied
-                },
-                InstalledFile {
-                    path: installed_dll.clone(),
-                    outcome: FileOutcome::Copied
-                },
-            ]
-        );
-        assert_eq!(fs::read(&installed_exe).unwrap(), b"exe v1");
-        assert_eq!(fs::read(&installed_dll).unwrap(), b"dll v1");
-
-        let expected_command = format!("\"{}\" run --hidden", installed_exe.display());
-        assert_eq!(report.autostart.as_deref(), Some(expected_command.as_str()));
-        assert_eq!(sb.autostart(), Some(expected_command));
+    fn uninstall_requires_manifest_and_preserves_unrelated_files() {
+        let sb = sandbox("unverified", start_ok);
+        fs::create_dir_all(&sb.env.root).unwrap();
+        let unrelated = sb.env.root.join("precious.txt");
+        fs::write(&unrelated, b"keep me").unwrap();
+        let err = uninstall_with(&sb.env, &UninstallArgs { purge: false }).unwrap_err();
+        assert!(err.to_string().contains("current.json"), "{err}");
+        assert!(unrelated.is_file());
     }
 
     #[test]
-    fn install_is_repeatable_and_upgrades_the_files() {
-        let sb = sandbox("install_twice");
-        install_with(&sb.env, FULL).expect("first install");
-        fs::write(&sb.env.exe, b"exe v2").unwrap();
+    fn uninstall_does_not_descend_into_junctions_or_delete_unrelated_user_files() {
+        use std::os::windows::process::CommandExt;
+        let sb = sandbox("junction", start_ok);
+        install_with(&sb.env, &flags()).unwrap();
+        let external = sb._dir.path().join("external_precious");
+        fs::create_dir_all(&external).unwrap();
+        let precious = external.join("precious.txt");
+        fs::write(&precious, b"do not delete").unwrap();
+        let user_note = sb.env.root.join("user-note.txt");
+        fs::write(&user_note, b"keep me too").unwrap();
+        let link = sb.env.root.join("versions").join("linked_dir");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &external.to_string_lossy(),
+            ])
+            .creation_flags(0x0800_0000)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
 
-        let second = install_with(&sb.env, FULL).expect("second install");
-
-        assert!(!second.classic.changed, "classic menu was already on");
-        assert!(sb.classic_enabled());
-        assert_eq!(fs::read(sb.env.bin_dir.join("rwm.exe")).unwrap(), b"exe v2");
-        assert_eq!(second.autostart, None);
-        assert_eq!(sb.autostart(), None, "autostart is only written on request");
+        uninstall_with(&sb.env, &UninstallArgs { purge: false }).unwrap();
+        assert!(precious.is_file(), "junction target file was modified");
+        assert!(user_note.is_file(), "unrelated root file was deleted");
+        let _ = fs::remove_dir(&link);
     }
 
     #[test]
-    fn classic_only_install_copies_nothing_even_when_the_files_are_there() {
-        let sb = sandbox("install_classic_only");
-        assert!(sb.env.hook_dll.is_some());
-
-        let report = install_with(&sb.env, InstallMode::ClassicOnly).expect("classic-only install");
-
-        assert!(sb.classic_enabled());
-        assert_eq!(report.files, Vec::new());
-        assert!(!sb.env.bin_dir.exists());
-        assert_eq!(sb.autostart(), None);
-    }
-
-    #[test]
-    fn classic_only_install_needs_no_hook_dll() {
-        let mut sb = sandbox("install_classic_only_no_dll");
-        sb.env.hook_dll = None;
-
-        install_with(&sb.env, InstallMode::ClassicOnly).expect("classic-only install");
-
-        assert!(sb.classic_enabled());
-    }
-
-    #[test]
-    fn missing_hook_dll_stops_the_install_before_anything_changes() {
-        let mut sb = sandbox("install_no_dll");
-        sb.env.hook_dll = None;
-
-        let err = install_with(&sb.env, WITH_AUTOSTART).unwrap_err();
-
-        assert!(err.to_string().contains("rwm_hook.dll was not found"));
-        assert!(!sb.classic_enabled());
-        assert!(!sb.env.classic.backup_path.exists());
-        assert!(!sb.env.bin_dir.exists());
-        assert_eq!(sb.autostart(), None);
-    }
-
-    #[test]
-    fn installing_from_the_bin_folder_leaves_the_files_in_place() {
-        let mut sb = sandbox("install_in_place");
-        install_with(&sb.env, FULL).expect("first install");
-        sb.env.exe = sb.env.bin_dir.join("rwm.exe");
-        sb.env.hook_dll = Some(sb.env.bin_dir.join("rwm_hook.dll"));
-
-        let report = install_with(&sb.env, FULL).expect("install from the installed copy");
-
-        assert!(report
-            .files
-            .iter()
-            .all(|file| file.outcome == FileOutcome::AlreadyInPlace));
-        assert_eq!(fs::read(sb.env.bin_dir.join("rwm.exe")).unwrap(), b"exe v1");
-    }
-
-    #[test]
-    fn an_in_use_file_is_renamed_aside_and_replaced() {
-        let sb = sandbox("install_in_use");
-        fs::create_dir_all(&sb.env.bin_dir).unwrap();
-        let installed_dll = sb.env.bin_dir.join("rwm_hook.dll");
-        fs::copy(system_image(), &installed_dll).unwrap();
-        let mapped = MappedImage::map(&installed_dll);
-
-        let report = install_with(&sb.env, FULL).expect("install over a mapped DLL");
-
-        assert_eq!(report.files[0].outcome, FileOutcome::Copied);
-        assert_eq!(report.files[1].outcome, FileOutcome::ReplacedInUse);
-        assert_eq!(fs::read(&installed_dll).unwrap(), b"dll v1");
-        let aside = sibling_with_suffix(&installed_dll, SET_ASIDE_SUFFIX);
-        assert!(
-            aside.exists(),
-            "the mapped copy stays available to its user"
-        );
-
-        drop(mapped);
-        install_with(&sb.env, FULL).expect("next install");
-        assert!(
-            !aside.exists(),
-            "the set-aside copy is cleaned up once it is free"
-        );
-    }
-
-    #[test]
-    fn uninstall_reverses_a_full_install() {
-        let sb = sandbox("uninstall_full");
-        install_with(&sb.env, WITH_AUTOSTART).expect("install");
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        assert!(report.succeeded());
-        assert_eq!(report.autostart_removed, Ok(true));
-        assert_eq!(report.host, StopOutcome::NotRunning);
-        assert_eq!(report.detach, None);
-        assert_eq!(report.files, Removal::Removed);
-        assert!(matches!(
-            &report.classic,
-            ClassicStep::Restored(applied) if applied.changed && !applied.enabled
-        ));
-
-        assert_eq!(sb.autostart(), None);
-        assert!(!sb.env.bin_dir.exists());
-        assert!(!sb.classic_enabled());
-        assert!(!sb.env.classic.backup_path.exists());
-    }
-
-    #[test]
-    fn uninstall_is_repeatable_when_nothing_is_installed() {
-        let sb = sandbox("uninstall_twice");
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        assert!(report.succeeded());
-        assert_eq!(report.autostart_removed, Ok(false));
-        assert_eq!(report.files, Removal::NotInstalled);
-        assert!(matches!(report.classic, ClassicStep::NothingToRestore));
-    }
-
-    /// Switches the classic menu on the way a user's own registry tweak does: the key is
-    /// there, but rwm holds no backup for it.
-    fn enable_classic_outside_rwm(sb: &Sandbox) {
-        classic::enable(&sb.env.classic, false, false, false).expect("enable scratch classic menu");
-        fs::remove_file(&sb.env.classic.backup_path).expect("drop the backup");
-        assert!(sb.classic_enabled());
-    }
-
-    #[test]
-    fn uninstall_leaves_a_classic_menu_that_rwm_did_not_switch_on() {
-        let sb = sandbox("uninstall_foreign_classic");
-        enable_classic_outside_rwm(&sb);
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        assert!(matches!(report.classic, ClassicStep::NothingToRestore));
-        assert!(report.succeeded());
-        assert!(sb.classic_enabled(), "the user's own setting survives");
-    }
-
-    #[test]
-    fn uninstall_restores_a_classic_menu_that_was_on_before_install() {
-        let sb = sandbox("uninstall_prior_classic");
-        enable_classic_outside_rwm(&sb);
-        install_with(&sb.env, FULL).expect("install");
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        assert!(matches!(
-            &report.classic,
-            ClassicStep::Restored(applied) if applied.enabled
-        ));
-        assert!(
-            sb.classic_enabled(),
-            "uninstall returns to the state before install"
-        );
-        assert!(!sb.env.classic.backup_path.exists());
-    }
-
-    #[test]
-    fn keep_classic_leaves_the_classic_menu_on() {
-        let sb = sandbox("uninstall_keep");
-        install_with(&sb.env, FULL).expect("install");
-
-        let report = uninstall_with(&sb.env, &UninstallArgs { keep_classic: true });
-
-        assert!(report.succeeded());
-        assert!(matches!(report.classic, ClassicStep::Kept));
-        assert!(sb.classic_enabled());
-        assert!(!sb.env.bin_dir.exists());
-    }
-
-    #[test]
-    fn uninstall_moves_a_still_mapped_file_out_of_the_bin_folder() {
-        let sb = sandbox("uninstall_in_use");
-        install_with(&sb.env, FULL).expect("install");
-        let installed_dll = sb.env.bin_dir.join("rwm_hook.dll");
-        fs::copy(system_image(), &installed_dll).unwrap();
-        let mapped = MappedImage::map(&installed_dll);
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        let moved = renamed_into(
-            sb.env.bin_dir.parent().unwrap(),
-            &installed_dll,
-            LEFTOVER_SUFFIX,
-        );
-        assert_eq!(
-            report.files,
-            Removal::RemovedWithLeftovers(vec![moved.clone()])
-        );
-        assert!(report.succeeded());
-        assert!(!sb.env.bin_dir.exists());
-        assert!(moved.exists());
-
-        drop(mapped);
-        assert_eq!(
-            uninstall_with(&sb.env, &REMOVE_ALL).files,
-            Removal::NotInstalled
-        );
-        assert!(!moved.exists(), "the leftover is deleted once it is free");
-    }
-
-    #[test]
-    fn uninstall_asks_a_running_host_to_stop_first() {
-        let sb = sandbox("uninstall_host");
-        install_with(&sb.env, FULL).expect("install");
-
-        let (claimed, wait_claimed) = std::sync::mpsc::channel();
-        let event = sb.env.host_event.clone();
-        let host = std::thread::spawn(move || {
-            let signal = host::HostSignal::claim(&event).expect("claim scratch host event");
-            claimed.send(()).unwrap();
-            signal.wait_for_stop(Duration::from_secs(10))
-        });
-        wait_claimed.recv().unwrap();
-
-        let report = uninstall_with(&sb.env, &REMOVE_ALL);
-
-        assert_eq!(report.host, StopOutcome::Stopped);
-        assert!(host.join().unwrap(), "the host saw the stop request");
-        assert!(report.succeeded());
-    }
-
-    #[test]
-    fn reports_read_like_a_summary_of_what_happened() {
-        let sb = sandbox("render");
-        let installed = install_with(&sb.env, WITH_AUTOSTART).expect("install");
-        let text = render_install(&installed);
-        assert!(text.starts_with("Classic context menu: on\nMenuShowDelay: 0 ms\n"));
-        assert!(text.contains(r"Config: kept C:\scratch\config.toml"));
-        assert!(text.contains(&format!(
-            "Installed {}",
-            sb.env.bin_dir.join("rwm.exe").display()
-        )));
-        assert!(text.contains("Autostart at sign-in: \""));
-        assert!(text.contains("Start the menu accelerator with: \""));
-
-        let removed = uninstall_with(&sb.env, &REMOVE_ALL);
-        let kept_config = Path::new(r"C:\scratch\config.toml");
-        let text = render_uninstall(&removed, &sb.env.bin_dir, Some(kept_config));
-        assert!(text.contains("Autostart entry removed."));
-        assert!(text.contains("No hook host was running."));
-        assert!(text.contains("No Explorer window is open"));
-        assert!(text.contains(&format!("Removed {}", sb.env.bin_dir.display())));
-        assert!(text.contains("Classic context menu: off\n"));
-        assert!(text.contains(r"Your config was kept: C:\scratch\config.toml"));
-        assert!(!text.contains("FAILED"));
-        assert!(!render_uninstall(&removed, &sb.env.bin_dir, None).contains("Your config"));
+    fn upgrade_removes_legacy_v01_bin_dll_and_uses_versioned_layout() {
+        let sb = sandbox("v01upgrade", start_ok);
+        fs::create_dir_all(sb.env.bin()).unwrap();
+        let legacy_dll = sb.env.bin().join("rwm_hook.dll");
+        fs::write(&legacy_dll, b"old v0.1 hook dll").unwrap();
+        install_with(&sb.env, &flags()).unwrap();
+        assert!(!legacy_dll.exists(), "stale v0.1 bin\\rwm_hook.dll must be cleaned up");
+        assert!(sb
+            .env
+            .root
+            .join("versions")
+            .join(BUILD_ID)
+            .join(versioned_dll_filename())
+            .is_file());
     }
 }

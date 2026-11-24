@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-#[derive(Debug, PartialEq, Eq, Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "rwm",
     version,
-    about = "RustWindowsMenu: an instant classic right-click menu for Windows 11",
+    about = "RustWindowsMenu 0.2: fast native Windows menus",
     arg_required_else_help = true
 )]
 pub struct Cli {
@@ -14,166 +14,175 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Show Windows, classic menu, config, hook DLL, and Explorer state
+    Install(InstallArgs),
+    Uninstall(UninstallArgs),
+    Start,
+    Stop,
     Status {
-        /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Switch Windows 11 between its new menu and the classic context menu
-    Classic {
-        #[command(subcommand)]
-        action: ClassicAction,
-    },
-    /// Profile menu latency for a path: Rust Stage 0 against synchronous COM handlers
+    Doctor(DoctorArgs),
     Bench(BenchArgs),
-    /// Inspect the shell verbs and COM handlers registered for a path
+    Inspect(InspectArgs),
+    Preview(PreviewArgs),
     Handlers {
         #[command(subcommand)]
         action: HandlersAction,
     },
-    /// Open the real Direct2D popup menu for a path
-    Preview(PreviewArgs),
-    /// Host the Explorer hook in the foreground until Ctrl+C
-    Run {
-        /// Detach from the console window (used by autostart)
-        #[arg(long)]
-        hidden: bool,
+    Classic {
+        #[command(subcommand)]
+        action: ClassicAction,
     },
-    /// Ask a running hook host (including `rwm run --hidden`) to detach and exit
-    Stop,
-    /// Enable the classic menu and install rwm into %LOCALAPPDATA%\RustWindowsMenu\bin
-    Install(InstallArgs),
-    /// Remove the installed files and autostart entry, and restore the Windows 11 menu
-    Uninstall(UninstallArgs),
-    /// Create, locate, or validate config.toml
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Check that this PC can run RustWindowsMenu
-    Doctor,
+    Run,
+    #[command(name = "__probe-worker", hide = true)]
+    ProbeWorker(ProbeWorkerArgs),
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
-pub enum ClassicAction {
-    /// Turn the classic context menu on
-    Enable {
-        /// Leave MenuShowDelay as it is instead of setting it to 0
-        #[arg(long)]
-        no_delay_opt: bool,
-        /// Restart explorer.exe so the change applies immediately
-        #[arg(long)]
-        restart_explorer: bool,
-    },
-    /// Restore the state from before `rwm classic enable`
-    Disable {
-        /// Restart explorer.exe so the change applies immediately
-        #[arg(long)]
-        restart_explorer: bool,
-    },
-    /// Show whether the classic context menu is on
-    Status {
-        /// Print the status as JSON
-        #[arg(long)]
-        json: bool,
-    },
+#[derive(Debug, Clone, Args)]
+pub struct InstallArgs {
+    #[arg(long)]
+    pub classic: bool,
+    #[arg(long)]
+    pub no_startup: bool,
+    #[arg(long)]
+    pub no_path: bool,
+    #[arg(long)]
+    pub no_start: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
-pub enum HandlersAction {
-    /// List static verbs and COM handlers with their config policy
-    List(HandlersListArgs),
+#[derive(Debug, Clone, Args)]
+pub struct UninstallArgs {
+    #[arg(long)]
+    pub purge: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
-pub enum ConfigAction {
-    /// Write the default config.toml unless one already exists
-    Init,
-    /// Print the config file path
-    Path,
-    /// Parse and validate the config file
-    Validate,
-}
-
-/// The right-click target shared by `bench`, `handlers list`, and `preview`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct TargetArgs {
-    /// File, folder, or drive to right-click. Without it: this executable as a sample
-    /// file, or the current folder with --background
     pub path: Option<PathBuf>,
-    /// Right-click the empty background of the folder instead of an item
     #[arg(long)]
     pub background: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Args)]
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, default_value_t = 30_000, hide = true)]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
 pub struct BenchArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Print the report as JSON
+    #[arg(long, default_value_t = 5)]
+    pub runs: usize,
     #[arg(long)]
     pub json: bool,
+    #[arg(long, default_value_t = 30_000, hide = true)]
+    pub timeout_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, Args)]
-pub struct HandlersListArgs {
+#[derive(Debug, Args)]
+pub struct InspectArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Print the list as JSON
+    #[arg(long)]
+    pub extended: bool,
     #[arg(long)]
     pub json: bool,
+    #[arg(long, default_value_t = 30_000, hide = true)]
+    pub timeout_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, Args)]
+#[derive(Debug, Args)]
 pub struct PreviewArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Show the Stage 0 timing badge in the menu and print the timings afterwards
     #[arg(long)]
-    pub timings: bool,
-    /// Open at the screen centre, close after this many milliseconds, and print a summary
-    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u32).range(1..))]
-    pub smoke_test_ms: Option<u32>,
+    pub extended: bool,
+    #[arg(long)]
+    pub no_animation: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Args)]
-pub struct InstallArgs {
-    /// Only enable the classic menu and create the config; copy no files
-    #[arg(long)]
-    pub classic_only: bool,
-    /// Start `rwm run` at sign-in through the HKCU Run key
-    #[arg(long, conflicts_with = "classic_only")]
-    pub autostart: bool,
+#[derive(Debug, Subcommand)]
+pub enum HandlersAction {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Block {
+        clsid: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Unblock {
+        clsid: String,
+        #[arg(long)]
+        force: bool,
+    },
+    Reset,
 }
 
-#[derive(Debug, PartialEq, Eq, Args)]
-pub struct UninstallArgs {
-    /// Leave the classic context menu switched on
-    #[arg(long)]
-    pub keep_classic: bool,
+#[derive(Debug, Subcommand)]
+pub enum ClassicAction {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Enable {
+        #[arg(long)]
+        restart: bool,
+    },
+    Disable {
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        restart: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    Path,
+    Show,
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    Reset,
+}
+
+#[derive(Debug, Args)]
+pub struct ProbeWorkerArgs {
+    #[command(subcommand)]
+    pub action: ProbeWorkerAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProbeWorkerAction {
+    Inspect(InspectArgs),
+    Bench(BenchArgs),
+    #[command(hide = true)]
+    Sleep {
+        #[arg(long)]
+        sleep_ms: u64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::error::ErrorKind;
-    use clap::CommandFactory;
-
     use super::*;
-
-    fn parse(args: &[&str]) -> Command {
-        Cli::try_parse_from(args.iter().copied())
-            .unwrap_or_else(|err| panic!("{args:?} should parse: {err}"))
-            .command
-    }
-
-    fn parse_error(args: &[&str]) -> ErrorKind {
-        Cli::try_parse_from(args.iter().copied())
-            .expect_err("arguments should be rejected")
-            .kind()
-    }
+    use clap::CommandFactory;
 
     #[test]
     fn command_definition_is_consistent() {
@@ -181,198 +190,49 @@ mod tests {
     }
 
     #[test]
-    fn status_and_doctor_and_run() {
-        assert_eq!(parse(&["rwm", "status"]), Command::Status { json: false });
-        assert_eq!(
-            parse(&["rwm", "status", "--json"]),
-            Command::Status { json: true }
-        );
-        assert_eq!(parse(&["rwm", "doctor"]), Command::Doctor);
-        assert_eq!(
-            parse(&["rwm", "run"]),
-            Command::Run { hidden: false }
-        );
-        assert_eq!(
-            parse(&["rwm", "run", "--hidden"]),
-            Command::Run { hidden: true }
-        );
-        assert_eq!(parse(&["rwm", "stop"]), Command::Stop);
-    }
-
-    #[test]
-    fn classic_actions() {
-        assert_eq!(
-            parse(&["rwm", "classic", "enable"]),
-            Command::Classic {
-                action: ClassicAction::Enable {
-                    no_delay_opt: false,
-                    restart_explorer: false
-                }
-            }
-        );
-        assert_eq!(
-            parse(&[
+    fn complete_surface_parses() {
+        for args in [
+            vec![
                 "rwm",
-                "classic",
-                "enable",
-                "--no-delay-opt",
-                "--restart-explorer"
-            ]),
-            Command::Classic {
-                action: ClassicAction::Enable {
-                    no_delay_opt: true,
-                    restart_explorer: true
-                }
-            }
-        );
-        assert_eq!(
-            parse(&["rwm", "classic", "disable", "--restart-explorer"]),
-            Command::Classic {
-                action: ClassicAction::Disable {
-                    restart_explorer: true
-                }
-            }
-        );
-        assert_eq!(
-            parse(&["rwm", "classic", "status", "--json"]),
-            Command::Classic {
-                action: ClassicAction::Status { json: true }
-            }
-        );
-        assert_eq!(
-            parse_error(&["rwm", "classic", "disable", "--no-delay-opt"]),
-            ErrorKind::UnknownArgument
-        );
-    }
-
-    #[test]
-    fn bench_target_forms() {
-        assert_eq!(
-            parse(&["rwm", "bench"]),
-            Command::Bench(BenchArgs {
-                target: TargetArgs::default(),
-                json: false
-            })
-        );
-        assert_eq!(
-            parse(&["rwm", "bench", r"C:\Windows", "--background", "--json"]),
-            Command::Bench(BenchArgs {
-                target: TargetArgs {
-                    path: Some(PathBuf::from(r"C:\Windows")),
-                    background: true
-                },
-                json: true
-            })
-        );
-        assert_eq!(
-            parse_error(&["rwm", "bench", "one", "two"]),
-            ErrorKind::UnknownArgument
-        );
-    }
-
-    #[test]
-    fn handlers_list() {
-        assert_eq!(
-            parse(&["rwm", "handlers", "list", "notes.txt", "--json"]),
-            Command::Handlers {
-                action: HandlersAction::List(HandlersListArgs {
-                    target: TargetArgs {
-                        path: Some(PathBuf::from("notes.txt")),
-                        background: false
-                    },
-                    json: true
-                })
-            }
-        );
-        assert_eq!(
-            parse_error(&["rwm", "handlers"]),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
-    }
-
-    #[test]
-    fn preview_options() {
-        assert_eq!(
-            parse(&[
+                "install",
+                "--classic",
+                "--no-startup",
+                "--no-path",
+                "--no-start",
+            ],
+            vec!["rwm", "uninstall", "--purge"],
+            vec!["rwm", "start"],
+            vec!["rwm", "stop"],
+            vec!["rwm", "status", "--json"],
+            vec!["rwm", "doctor", "--background", "--json"],
+            vec!["rwm", "bench", "--runs", "3", "--json"],
+            vec!["rwm", "inspect", "--extended", "--json"],
+            vec!["rwm", "preview", "--extended", "--no-animation"],
+            vec!["rwm", "handlers", "list", "--json"],
+            vec![
                 "rwm",
-                "preview",
-                "--background",
-                "--timings",
-                "--smoke-test-ms",
-                "750"
-            ]),
-            Command::Preview(PreviewArgs {
-                target: TargetArgs {
-                    path: None,
-                    background: true
-                },
-                timings: true,
-                smoke_test_ms: Some(750)
-            })
-        );
-        assert_eq!(
-            parse_error(&["rwm", "preview", "--smoke-test-ms", "soon"]),
-            ErrorKind::ValueValidation
-        );
-        assert_eq!(
-            parse_error(&["rwm", "preview", "--smoke-test-ms", "0"]),
-            ErrorKind::ValueValidation
-        );
-    }
-
-    #[test]
-    fn install_and_uninstall_flags() {
-        assert_eq!(
-            parse(&["rwm", "install"]),
-            Command::Install(InstallArgs {
-                classic_only: false,
-                autostart: false
-            })
-        );
-        assert_eq!(
-            parse(&["rwm", "install", "--autostart"]),
-            Command::Install(InstallArgs {
-                classic_only: false,
-                autostart: true
-            })
-        );
-        assert_eq!(
-            parse(&["rwm", "install", "--classic-only"]),
-            Command::Install(InstallArgs {
-                classic_only: true,
-                autostart: false
-            })
-        );
-        assert_eq!(
-            parse_error(&["rwm", "install", "--classic-only", "--autostart"]),
-            ErrorKind::ArgumentConflict
-        );
-        assert_eq!(
-            parse(&["rwm", "uninstall", "--keep-classic"]),
-            Command::Uninstall(UninstallArgs { keep_classic: true })
-        );
-    }
-
-    #[test]
-    fn config_actions() {
-        for (word, action) in [
-            ("init", ConfigAction::Init),
-            ("path", ConfigAction::Path),
-            ("validate", ConfigAction::Validate),
+                "handlers",
+                "block",
+                "{01234567-89AB-CDEF-0123-456789ABCDEF}",
+            ],
+            vec![
+                "rwm",
+                "handlers",
+                "unblock",
+                "{01234567-89AB-CDEF-0123-456789ABCDEF}",
+                "--force",
+            ],
+            vec!["rwm", "handlers", "reset"],
+            vec!["rwm", "classic", "status", "--json"],
+            vec!["rwm", "classic", "enable", "--restart"],
+            vec!["rwm", "classic", "disable", "--force", "--restart"],
+            vec!["rwm", "config", "path"],
+            vec!["rwm", "config", "show"],
+            vec!["rwm", "config", "init", "--force"],
+            vec!["rwm", "config", "reset"],
+            vec!["rwm", "run"],
         ] {
-            assert_eq!(parse(&["rwm", "config", word]), Command::Config { action });
+            Cli::try_parse_from(args).unwrap();
         }
-    }
-
-    #[test]
-    fn missing_or_unknown_subcommands_are_rejected() {
-        assert_eq!(
-            parse_error(&["rwm"]),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
-        assert_eq!(
-            parse_error(&["rwm", "explode"]),
-            ErrorKind::InvalidSubcommand
-        );
     }
 }

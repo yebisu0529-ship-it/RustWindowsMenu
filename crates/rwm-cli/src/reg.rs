@@ -1,18 +1,14 @@
-//! String values under `HKEY_CURRENT_USER`, the only registry data the CLI itself owns.
-//! The classic-menu keys belong to `rwm_core::classic`.
-
 use std::io;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
-    REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_OPTION_VOLATILE, REG_SAM_FLAGS, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
 };
 
 struct Key(HKEY);
-
 impl Drop for Key {
     fn drop(&mut self) {
         unsafe {
@@ -24,7 +20,6 @@ impl Drop for Key {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
-
 fn check(code: WIN32_ERROR) -> io::Result<()> {
     if code == ERROR_SUCCESS {
         Ok(())
@@ -33,7 +28,6 @@ fn check(code: WIN32_ERROR) -> io::Result<()> {
     }
 }
 
-/// Opens an existing key. `None` when the key does not exist.
 fn open(subkey: &str, access: REG_SAM_FLAGS) -> io::Result<Option<Key>> {
     let subkey = wide(subkey);
     let mut key = HKEY::default();
@@ -53,7 +47,7 @@ fn open(subkey: &str, access: REG_SAM_FLAGS) -> io::Result<Option<Key>> {
     Ok(Some(Key(key)))
 }
 
-fn create(subkey: &str, options: REG_OPEN_CREATE_OPTIONS) -> io::Result<Key> {
+fn create(subkey: &str) -> io::Result<Key> {
     let subkey = wide(subkey);
     let mut key = HKEY::default();
     check(unsafe {
@@ -62,8 +56,8 @@ fn create(subkey: &str, options: REG_OPEN_CREATE_OPTIONS) -> io::Result<Key> {
             PCWSTR(subkey.as_ptr()),
             0,
             PCWSTR::null(),
-            options,
-            KEY_SET_VALUE,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_QUERY_VALUE,
             None,
             &mut key,
             None,
@@ -72,69 +66,97 @@ fn create(subkey: &str, options: REG_OPEN_CREATE_OPTIONS) -> io::Result<Key> {
     Ok(Key(key))
 }
 
-fn set_string(key: &Key, value: &str, data: &str) -> io::Result<()> {
-    let value = wide(value);
-    let bytes: Vec<u8> = wide(data).into_iter().flat_map(u16::to_le_bytes).collect();
-    check(unsafe { RegSetValueExW(key.0, PCWSTR(value.as_ptr()), 0, REG_SZ, Some(&bytes)) })
+fn decode(bytes: &[u8]) -> String {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
 }
 
-/// Reads a string value. `None` when the key or the value does not exist.
-pub fn read_string(subkey: &str, value: &str) -> io::Result<Option<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedString {
+    pub value: String,
+    pub expand: bool,
+}
+
+pub fn read_typed_string(subkey: &str, value: &str) -> io::Result<Option<TypedString>> {
     let Some(key) = open(subkey, KEY_QUERY_VALUE)? else {
         return Ok(None);
     };
-    let value = wide(value);
-
-    let mut byte_len = 0u32;
+    let value_wide = wide(value);
+    let mut kind = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
+    let mut len = 0u32;
     let code = unsafe {
         RegQueryValueExW(
             key.0,
-            PCWSTR(value.as_ptr()),
+            PCWSTR(value_wide.as_ptr()),
             None,
+            Some(&mut kind),
             None,
-            None,
-            Some(&mut byte_len),
+            Some(&mut len),
         )
     };
     if code == ERROR_FILE_NOT_FOUND {
         return Ok(None);
     }
     check(code)?;
-
-    let mut bytes = vec![0u8; byte_len as usize];
+    if kind != REG_SZ && kind != REG_EXPAND_SZ {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{subkey}\\{value} is not a string value"),
+        ));
+    }
+    let mut bytes = vec![0u8; len as usize];
     check(unsafe {
         RegQueryValueExW(
             key.0,
-            PCWSTR(value.as_ptr()),
+            PCWSTR(value_wide.as_ptr()),
             None,
             None,
             Some(bytes.as_mut_ptr()),
-            Some(&mut byte_len),
+            Some(&mut len),
         )
     })?;
-    bytes.truncate(byte_len as usize);
-
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .take_while(|unit| *unit != 0)
-        .collect();
-    Ok(Some(String::from_utf16_lossy(&units)))
+    bytes.truncate(len as usize);
+    Ok(Some(TypedString {
+        value: decode(&bytes),
+        expand: kind == REG_EXPAND_SZ,
+    }))
 }
 
-/// Writes a `REG_SZ` value, creating the key when needed.
+pub fn read_string(subkey: &str, value: &str) -> io::Result<Option<String>> {
+    Ok(read_typed_string(subkey, value)?.map(|value| value.value))
+}
+
+fn write_typed(subkey: &str, value: &str, data: &str, expand: bool) -> io::Result<()> {
+    let key = create(subkey)?;
+    let value = wide(value);
+    let bytes = wide(data)
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    check(unsafe {
+        RegSetValueExW(
+            key.0,
+            PCWSTR(value.as_ptr()),
+            0,
+            if expand { REG_EXPAND_SZ } else { REG_SZ },
+            Some(&bytes),
+        )
+    })
+}
+
 pub fn write_string(subkey: &str, value: &str, data: &str) -> io::Result<()> {
-    let key = create(subkey, REG_OPTION_NON_VOLATILE)?;
-    set_string(&key, value, data)
+    write_typed(subkey, value, data, false)
 }
 
-/// Deletes a value. False when it was not there.
 pub fn delete_value(subkey: &str, value: &str) -> io::Result<bool> {
     let Some(key) = open(subkey, KEY_SET_VALUE)? else {
         return Ok(false);
     };
-    let value = wide(value);
-    let code = unsafe { RegDeleteValueW(key.0, PCWSTR(value.as_ptr())) };
+    let code = unsafe { RegDeleteValueW(key.0, PCWSTR(wide(value).as_ptr())) };
     if code == ERROR_FILE_NOT_FOUND {
         return Ok(false);
     }
@@ -142,60 +164,115 @@ pub fn delete_value(subkey: &str, value: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Proves HKCU is writable by creating, writing, and deleting a scratch key. The key is
-/// volatile, so it never reaches the registry file even if the delete fails.
-pub fn probe_write_access() -> io::Result<()> {
-    let subkey = format!(
-        r"Software\RustWindowsMenu_WriteProbe_{}",
-        std::process::id()
+pub fn delete_tree(subkey: &str) -> io::Result<()> {
+    let code = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(subkey).as_ptr())) };
+    if code == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        check(code)
+    }
+}
+
+fn same_path_entry(left: &str, right: &str) -> bool {
+    let normalize = |entry: &str| {
+        entry
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches(['\\', '/'])
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
+}
+
+pub fn update_path_entries(existing: Option<&str>, bin: &std::path::Path, remove: bool) -> String {
+    let bin = bin.to_string_lossy();
+    let mut entries = existing
+        .unwrap_or_default()
+        .split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    entries.retain(|entry| !same_path_entry(entry, &bin));
+    if !remove {
+        entries.push(bin.into_owned());
+    }
+    entries.join(";")
+}
+
+pub fn update_user_path_in_key(
+    subkey: &str,
+    bin: &std::path::Path,
+    remove: bool,
+) -> io::Result<bool> {
+    let previous = read_typed_string(subkey, "Path")?;
+    let bin_text = bin.to_string_lossy();
+    let already_present = previous.as_ref().is_some_and(|entry| {
+        entry
+            .value
+            .split(';')
+            .any(|segment| same_path_entry(segment, &bin_text))
+    });
+    if remove && !already_present {
+        return Ok(false);
+    }
+    let updated = update_path_entries(
+        previous.as_ref().map(|entry| entry.value.as_str()),
+        bin,
+        remove,
     );
-    let written =
-        create(&subkey, REG_OPTION_VOLATILE).and_then(|key| set_string(&key, "probe", "1"));
-    let wide_subkey = wide(&subkey);
-    let deleted = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(wide_subkey.as_ptr())) };
-    written?;
-    check(deleted)
+    if previous
+        .as_ref()
+        .is_some_and(|entry| entry.value == updated)
+    {
+        return Ok(false);
+    }
+    if remove && previous.is_none() {
+        return Ok(false);
+    }
+    write_typed(
+        subkey,
+        "Path",
+        &updated,
+        previous.as_ref().is_none_or(|entry| entry.expand),
+    )?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::RegistryRoot;
+    use std::path::Path;
 
     #[test]
-    fn string_values_round_trip_and_delete_is_idempotent() {
-        let root = RegistryRoot::new("reg_round_trip");
-        let subkey = format!(r"{}\Run", root.path());
-
-        assert_eq!(read_string(&subkey, "RustWindowsMenu").unwrap(), None);
-        assert!(!delete_value(&subkey, "RustWindowsMenu").unwrap());
-
-        let command = r#""C:\Users\太郎\AppData\Local\RustWindowsMenu\bin\rwm.exe" run"#;
-        write_string(&subkey, "RustWindowsMenu", command).unwrap();
+    fn path_update_preserves_expand_type_and_is_idempotent() {
+        let root = RegistryRoot::new("path");
+        let subkey = format!(r"{}\Environment", root.path());
+        write_typed(&subkey, "Path", r"%USERPROFILE%\bin;C:\Tools", true).unwrap();
+        let bin = Path::new(r"C:\Users\Test\RustWindowsMenu\bin");
+        assert!(update_user_path_in_key(&subkey, bin, false).unwrap());
+        let once = read_typed_string(&subkey, "Path").unwrap().unwrap();
+        assert!(once.expand);
         assert_eq!(
-            read_string(&subkey, "RustWindowsMenu").unwrap().as_deref(),
-            Some(command)
+            once.value,
+            format!(r"%USERPROFILE%\bin;C:\Tools;{}", bin.display())
         );
-
-        write_string(&subkey, "RustWindowsMenu", "replaced").unwrap();
+        assert!(!update_user_path_in_key(&subkey, bin, false).unwrap());
+        assert!(update_user_path_in_key(&subkey, bin, true).unwrap());
         assert_eq!(
-            read_string(&subkey, "RustWindowsMenu").unwrap().as_deref(),
-            Some("replaced")
+            read_string(&subkey, "Path").unwrap().as_deref(),
+            Some(r"%USERPROFILE%\bin;C:\Tools")
         );
-        assert_eq!(read_string(&subkey, "Other").unwrap(), None);
-
-        assert!(delete_value(&subkey, "RustWindowsMenu").unwrap());
-        assert!(!delete_value(&subkey, "RustWindowsMenu").unwrap());
-        assert_eq!(read_string(&subkey, "RustWindowsMenu").unwrap(), None);
+        assert!(!update_user_path_in_key(&subkey, bin, true).unwrap());
     }
 
     #[test]
-    fn write_probe_succeeds_and_leaves_no_key_behind() {
-        probe_write_access().expect("HKCU is writable for the test user");
-        let subkey = format!(
-            r"Software\RustWindowsMenu_WriteProbe_{}",
-            std::process::id()
+    fn matching_ignores_case_quotes_and_trailing_slash_only_for_our_entry() {
+        let updated = update_path_entries(
+            Some("C:\\Other;\"c:\\rwm\\bin\""),
+            Path::new(r"C:\RWM\bin"),
+            true,
         );
-        assert!(open(&subkey, KEY_QUERY_VALUE).unwrap().is_none());
+        assert_eq!(updated, r"C:\Other");
     }
 }

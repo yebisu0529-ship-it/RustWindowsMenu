@@ -1,52 +1,68 @@
-//! The hook host behind `rwm run`: keeps `rwm_hook.dll` attached to every Explorer UI thread
-//! and detaches it again before the process exits.
-
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::windows::process::CommandExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rwm_core::config::RwmConfig;
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, FALSE, FILETIME, HANDLE, HINSTANCE,
-    HMODULE, TRUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Console::{
-    FreeConsole, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
-    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+    CTRL_SHUTDOWN_EVENT,
 };
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleBaseNameW};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetThreadTimes, OpenEventW, OpenProcess, OpenThread, SetEvent,
-    WaitForSingleObject, EVENT_MODIFY_STATE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-    SYNCHRONIZATION_ACCESS_RIGHTS, SYNCHRONIZATION_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION,
+    CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenMutexW, OpenProcess,
+    OpenProcessToken, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE,
+    PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, WH_CALLWNDPROC,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
+    GetShellWindow, GetWindowThreadProcessId, KillTimer, MsgWaitForMultipleObjects, PeekMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_CREATE, GWLP_USERDATA,
+    HHOOK, MSG, PM_REMOVE, QS_ALLINPUT, WH_CALLWNDPROC, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_DESTROY, WM_QUIT, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::error::{CliError, CliResult, Context};
-use crate::explorer::{self, ShellWindow};
-use crate::hookdll::{self, HookLibrary, SUPPORTED_ABI};
-use crate::output::{print_error_line, print_line};
+use crate::explorer::{self, Delivery, ShellWindow};
+use crate::hookdll::{self, HookLibrary};
+use crate::output::print_line;
 
-/// The event a running host owns. Its existence marks the host as running, and signalling it
-/// asks the host to stop. `Local\` scopes it to the sign-in session, like the hooks.
-pub const HOST_EVENT_NAME: &str = r"Local\RustWindowsMenu_HookHost_v1";
+pub const HOST_MUTEX_NAME: &str = r"Local\RustWindowsMenuHost_v2";
+pub const HOST_EVENT_NAME: &str = r"Local\RustWindowsMenu_HookHost_v2";
+pub const LEGACY_HOST_EVENT_NAME: &str = r"Local\RustWindowsMenu_HookHost_v1";
+pub const HOST_READY_EVENT_NAME: &str = r"Local\RustWindowsMenu_HookHost_v2.Ready";
+const DEBOUNCE_TIMER: usize = 1;
+const SWEEP_TIMER: usize = 2;
+const HOST_WINDOW_CLASS: &str = "RustWindowsMenuHost_v2";
 
-const SCAN_INTERVAL: Duration = Duration::from_millis(1000);
-
-/// Windows terminates a console process about five seconds after a close, logoff, or
-/// shutdown event, so the detach has to finish inside this window.
-const CONSOLE_CLOSE_GRACE: Duration = Duration::from_millis(4500);
-
+static HOST_HWND: AtomicIsize = AtomicIsize::new(0);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static HOST_FINISHED: AtomicBool = AtomicBool::new(false);
+static HOST_FINISHED: AtomicBool = AtomicBool::new(true);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostState {
+    Stopped,
+    Running,
+    RunningOtherIntegrity,
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
+}
+fn close(handle: windows::Win32::Foundation::HANDLE) {
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
 }
 
 #[derive(Debug)]
@@ -55,65 +71,174 @@ pub enum ClaimError {
     Os(windows::core::Error),
 }
 
-/// Ownership of the host event for as long as this value lives.
-pub struct HostSignal(HANDLE);
+pub struct HostSignal {
+    mutex: windows::Win32::Foundation::HANDLE,
+    event: windows::Win32::Foundation::HANDLE,
+    ready: windows::Win32::Foundation::HANDLE,
+}
 
 impl HostSignal {
-    pub fn claim(name: &str) -> Result<Self, ClaimError> {
-        let name = wide(name);
-        let event = unsafe { CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }
+    pub fn claim(mutex_name: &str, event_name: &str) -> Result<Self, ClaimError> {
+        let mutex = unsafe { CreateMutexW(None, false, PCWSTR(wide(mutex_name).as_ptr())) }
             .map_err(ClaimError::Os)?;
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe {
-                let _ = CloseHandle(event);
-            }
+            close(mutex);
             return Err(ClaimError::AlreadyRunning);
         }
-        Ok(Self(event))
+        let event =
+            match unsafe { CreateEventW(None, true, false, PCWSTR(wide(event_name).as_ptr())) } {
+                Ok(event) if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS => event,
+                Ok(event) => {
+                    close(event);
+                    close(mutex);
+                    return Err(ClaimError::AlreadyRunning);
+                }
+                Err(error) => {
+                    close(mutex);
+                    return Err(ClaimError::Os(error));
+                }
+            };
+        let ready_name = format!("{event_name}.Ready");
+        let ready =
+            match unsafe { CreateEventW(None, true, false, PCWSTR(wide(&ready_name).as_ptr())) } {
+                Ok(ready) => ready,
+                Err(error) => {
+                    close(event);
+                    close(mutex);
+                    return Err(ClaimError::Os(error));
+                }
+            };
+        Ok(Self {
+            mutex,
+            event,
+            ready,
+        })
     }
-
-    /// Blocks for up to `timeout`. True once a stop has been requested.
-    pub fn wait_for_stop(&self, timeout: Duration) -> bool {
-        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
-        unsafe { WaitForSingleObject(self.0, millis) == WAIT_OBJECT_0 }
+    pub fn event(&self) -> windows::Win32::Foundation::HANDLE {
+        self.event
+    }
+    pub fn mark_ready(&self) -> CliResult<()> {
+        unsafe { SetEvent(self.ready) }.map_err(|error| CliError::new(error.message()))
     }
 }
 
 impl Drop for HostSignal {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
+        close(self.ready);
+        close(self.event);
+        close(self.mutex);
     }
 }
 
-fn open_event(name: &str, access: SYNCHRONIZATION_ACCESS_RIGHTS) -> Option<HANDLE> {
-    let name = wide(name);
-    unsafe { OpenEventW(access, false, PCWSTR(name.as_ptr())) }.ok()
+fn process_is_elevated(process: HANDLE) -> Option<bool> {
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
+        return None;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    close(token);
+    ok.ok().map(|()| elevation.TokenIsElevated != 0)
+}
+
+pub fn ensure_matching_elevation(action: &str) -> CliResult<()> {
+    let Some(true) = process_is_elevated(unsafe { GetCurrentProcess() }) else {
+        return Ok(());
+    };
+    let shell_hwnd = unsafe { GetShellWindow() };
+    if shell_hwnd.is_invalid() {
+        return Ok(());
+    }
+    let mut shell_pid = 0u32;
+    unsafe { GetWindowThreadProcessId(shell_hwnd, Some(&mut shell_pid)) };
+    if shell_pid == 0 {
+        return Ok(());
+    }
+    if let Ok(shell_proc) = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, shell_pid) } {
+        let shell_elevated = process_is_elevated(shell_proc);
+        close(shell_proc);
+        if shell_elevated == Some(false) {
+            return Err(CliError::new(format!(
+                "refusing `{action}` from an elevated prompt while Explorer runs unelevated; re-run from a normal (non-Administrator) terminal"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn host_state(name: &str) -> HostState {
+    match unsafe {
+        OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            PCWSTR(wide(name).as_ptr()),
+        )
+    } {
+        Ok(handle) => {
+            close(handle);
+            HostState::Running
+        }
+        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            HostState::RunningOtherIntegrity
+        }
+        Err(_) => HostState::Stopped,
+    }
 }
 
 pub fn is_host_running(name: &str) -> bool {
-    match open_event(name, SYNCHRONIZATION_SYNCHRONIZE) {
-        Some(event) => {
-            unsafe {
-                let _ = CloseHandle(event);
-            }
+    !matches!(host_state(name), HostState::Stopped)
+}
+
+fn is_event_running(name: &str) -> bool {
+    match unsafe {
+        OpenEventW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            PCWSTR(wide(name).as_ptr()),
+        )
+    } {
+        Ok(event) => {
+            close(event);
             true
         }
-        None => false,
+        Err(_) => false,
     }
 }
 
-/// Signals the host event. False when no host owns it.
-fn request_stop(name: &str) -> bool {
-    let Some(event) = open_event(name, EVENT_MODIFY_STATE) else {
+fn is_host_ready() -> bool {
+    let Ok(event) = (unsafe {
+        OpenEventW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            PCWSTR(wide(HOST_READY_EVENT_NAME).as_ptr()),
+        )
+    }) else {
         return false;
     };
-    unsafe {
-        let signalled = SetEvent(event).is_ok();
-        let _ = CloseHandle(event);
-        signalled
-    }
+    let signalled = unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0;
+    close(event);
+    signalled
+}
+
+fn request_stop(name: &str) -> CliResult<bool> {
+    let event = match unsafe { OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(wide(name).as_ptr())) } {
+        Ok(event) => event,
+        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => return Ok(false),
+        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => return Err(CliError::new(format!("access denied opening host stop event {name}; the host is likely running at another integrity level (elevated vs standard) or session"))),
+        Err(error) => return Err(CliError::new(format!("cannot open host stop event {name}: {}", error.message()))),
+    };
+    let result = unsafe { SetEvent(event) }.map_err(|error| CliError::new(error.message()));
+    close(event);
+    result.map(|()| true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,47 +248,47 @@ pub enum StopOutcome {
     TimedOut,
 }
 
-/// Asks a running host to detach and exit, then waits until it has. The host closes the
-/// event last, after its hooks are gone, so the event disappearing means the detach is done.
-pub fn stop_running_host(name: &str, timeout: Duration) -> StopOutcome {
-    if !request_stop(name) {
-        return StopOutcome::NotRunning;
+pub fn stop_running_host(
+    mutex_name: &str,
+    event_name: &str,
+    timeout: Duration,
+) -> CliResult<StopOutcome> {
+    if !request_stop(event_name)? {
+        return Ok(StopOutcome::NotRunning);
     }
     let deadline = Instant::now() + timeout;
-    while is_host_running(name) {
+    while is_host_running(mutex_name) {
         if Instant::now() >= deadline {
-            return StopOutcome::TimedOut;
+            return Ok(StopOutcome::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    StopOutcome::Stopped
+    Ok(StopOutcome::Stopped)
 }
 
-/// The creation time of a live thread. Windows reuses thread ids, so an id alone does not
-/// say whether a hooked thread is still the same thread.
-fn thread_created_at(thread_id: u32) -> Option<u64> {
-    let thread = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, thread_id) }.ok()?;
-    let mut created = FILETIME::default();
-    let mut unused = [FILETIME::default(); 3];
-    let queried = unsafe {
-        GetThreadTimes(
-            thread,
-            &mut created,
-            &mut unused[0],
-            &mut unused[1],
-            &mut unused[2],
-        )
+pub fn stop() -> CliResult<ExitCode> {
+    let current = stop_running_host(HOST_MUTEX_NAME, HOST_EVENT_NAME, Duration::from_secs(10))?;
+    let legacy = if request_stop(LEGACY_HOST_EVENT_NAME)? {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while is_event_running(LEGACY_HOST_EVENT_NAME) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if is_event_running(LEGACY_HOST_EVENT_NAME) {
+            StopOutcome::TimedOut
+        } else {
+            StopOutcome::Stopped
+        }
+    } else {
+        StopOutcome::NotRunning
     };
-    unsafe {
-        let _ = CloseHandle(thread);
+    if current == StopOutcome::TimedOut || legacy == StopOutcome::TimedOut {
+        return Err(CliError::new(
+            "a hook host did not exit within the graceful shutdown timeout",
+        ));
     }
-    queried.ok()?;
-    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
-}
-
-struct AttachedHook {
-    handle: HHOOK,
-    thread_created: u64,
+    let detached = explorer::orphan_detach_sweep();
+    print_line(format!("Host stop: v0.2 {current:?}, v0.1 {legacy:?}; orphan detach sweep: {} acknowledgements / {} messages.", detached.acknowledged, detached.attempted));
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,1023 +299,535 @@ pub struct AttachFailure {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
-    /// Threads that received a hook in this scan.
     pub attached: Vec<u32>,
-    /// Threads that could not be hooked. Each is reported once.
     pub failed: Vec<AttachFailure>,
-    /// Hooked threads that have exited since the last scan.
     pub released: Vec<u32>,
-    /// Hooks held after this scan.
     pub hooked: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetachReport {
-    pub windows: usize,
-    pub windows_acknowledged: usize,
+    pub delivery: Delivery,
     pub hooks_removed: usize,
 }
 
-/// The `WH_CALLWNDPROC` hooks one host holds. Dropping the session detaches them, so a panic
-/// or an early return cannot leave Explorer hooked.
+struct AttachedHook {
+    handle: HHOOK,
+    views: Vec<ShellWindow>,
+}
+
 pub struct HookSession<'a> {
     library: &'a HookLibrary,
-    windows: Box<dyn FnMut() -> Vec<ShellWindow> + 'a>,
     hooks: BTreeMap<u32, AttachedHook>,
-    reported_failures: BTreeSet<(u32, u64)>,
 }
 
 impl<'a> HookSession<'a> {
-    /// `windows` lists the windows to serve. It is called for every scan and for the detach.
-    pub fn new(
-        library: &'a HookLibrary,
-        windows: Box<dyn FnMut() -> Vec<ShellWindow> + 'a>,
-    ) -> Self {
+    pub fn new(library: &'a HookLibrary) -> Self {
         Self {
             library,
-            windows,
             hooks: BTreeMap::new(),
-            reported_failures: BTreeSet::new(),
         }
     }
 
-    /// Hooks every listed UI thread that is not hooked yet.
     pub fn scan(&mut self) -> ScanReport {
-        let windows = (self.windows)();
-        let released = self.release_exited_threads();
-
-        let mut thread_processes: BTreeMap<u32, u32> = BTreeMap::new();
-        for window in &windows {
-            thread_processes
-                .entry(window.thread_id)
-                .or_insert(window.process_id);
+        let windows = explorer::enumerate_explorer_windows();
+        let views = explorer::explorer_views(&windows);
+        let active = explorer::ui_thread_ids(&views);
+        let stale = self
+            .hooks
+            .keys()
+            .filter(|tid| !active.contains(tid))
+            .copied()
+            .collect::<Vec<_>>();
+        for tid in &stale {
+            self.detach_one(*tid);
         }
-        let local_fp = local_pe_fingerprint(self.library.module());
-        let mut process_checks: BTreeMap<u32, Result<(), String>> = BTreeMap::new();
-
-        let mut attached = Vec::new();
-        let mut failed = Vec::new();
-        for thread_id in explorer::ui_thread_ids(&windows) {
-            if self.hooks.contains_key(&thread_id) {
-                continue;
-            }
-            let Some(thread_created) = thread_created_at(thread_id) else {
-                tracing::debug!(thread_id, "skipping a thread that cannot be queried");
-                continue;
-            };
-            if let (Some(expected), Some(&process_id)) =
-                (local_fp.as_ref(), thread_processes.get(&thread_id))
-            {
-                let check = process_checks.entry(process_id).or_insert_with(|| {
-                    remote_hook_dll_state(process_id, hookdll::HOOK_DLL_FILE, expected)
-                });
-                if let Err(reason) = check {
-                    if self.reported_failures.insert((thread_id, thread_created)) {
-                        failed.push(AttachFailure {
-                            thread_id,
-                            reason: reason.clone(),
-                        });
+        let mut report = ScanReport {
+            released: stale,
+            ..Default::default()
+        };
+        for tid in active {
+            let targets = views
+                .iter()
+                .filter(|view| view.thread_id == tid)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(attached) = self.hooks.get_mut(&tid) {
+                let current_ids: BTreeSet<isize> = targets.iter().map(|view| view.hwnd).collect();
+                let known_ids: BTreeSet<isize> =
+                    attached.views.iter().map(|view| view.hwnd).collect();
+                if !known_ids.is_empty() && known_ids.is_disjoint(&current_ids) {
+                    // All previous views on this TID vanished; re-hook in case Windows recycled the TID.
+                    self.detach_one(tid);
+                } else {
+                    let mut retained: Vec<ShellWindow> = targets
+                        .iter()
+                        .filter(|view| known_ids.contains(&view.hwnd))
+                        .cloned()
+                        .collect();
+                    let new_targets = targets
+                        .iter()
+                        .filter(|view| !known_ids.contains(&view.hwnd))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for view in new_targets {
+                        let delivery = explorer::send_message(
+                            std::slice::from_ref(&view),
+                            self.library.attach_message_id(),
+                        );
+                        if delivery.acknowledged == 1 {
+                            retained.push(view);
+                        } else if delivery.attempted > 0 {
+                            report.failed.push(AttachFailure {
+                                thread_id: tid,
+                                reason: "new SHELLDLL_DefView did not acknowledge attach".into(),
+                            });
+                        }
                     }
+                    attached.views = retained;
                     continue;
                 }
             }
-            let hooked = unsafe {
+            match unsafe {
                 SetWindowsHookExW(
                     WH_CALLWNDPROC,
                     self.library.hook_proc(),
                     HINSTANCE::from(self.library.module()),
-                    thread_id,
+                    tid,
                 )
-            };
-            match hooked {
+            } {
                 Ok(handle) => {
-                    self.hooks.insert(
-                        thread_id,
-                        AttachedHook {
-                            handle,
-                            thread_created,
-                        },
-                    );
-                    attached.push(thread_id);
-                }
-                Err(err) => {
-                    if self.reported_failures.insert((thread_id, thread_created)) {
-                        failed.push(AttachFailure {
-                            thread_id,
-                            reason: err.message(),
+                    let delivery =
+                        explorer::send_message(&targets, self.library.attach_message_id());
+                    if delivery.attempted == 0 || delivery.acknowledged != delivery.attempted {
+                        let _ = explorer::send_message(&targets, self.library.detach_message_id());
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(handle);
+                        }
+                        report.failed.push(AttachFailure {
+                            thread_id: tid,
+                            reason: format!(
+                                "attach acknowledged by {} of {} live SHELLDLL_DefView windows",
+                                delivery.acknowledged, delivery.attempted
+                            ),
                         });
+                    } else {
+                        self.hooks.insert(
+                            tid,
+                            AttachedHook {
+                                handle,
+                                views: targets,
+                            },
+                        );
+                        report.attached.push(tid);
                     }
                 }
+                Err(error) => report.failed.push(AttachFailure {
+                    thread_id: tid,
+                    reason: error.message(),
+                }),
             }
         }
-
-        if !attached.is_empty() {
-            if let Some(attach_id) = self.library.attach_message_id() {
-                let target_windows: Vec<ShellWindow> = windows
-                    .iter()
-                    .filter(|w| attached.contains(&w.thread_id))
-                    .cloned()
-                    .collect();
-                let _ = explorer::send_message_to_windows(&target_windows, attach_id);
-            }
-        }
-
-        ScanReport {
-            attached,
-            failed,
-            released,
-            hooked: self.hooks.len(),
-        }
+        report.hooked = self.hooks.len();
+        report
     }
 
-    /// Forgets hooks whose thread has exited. Windows removed those hooks together with the
-    /// thread, and the id may already belong to a new thread that needs its own hook.
-    fn release_exited_threads(&mut self) -> Vec<u32> {
-        let exited: Vec<u32> = self
-            .hooks
-            .iter()
-            .filter(|(thread_id, hook)| thread_created_at(**thread_id) != Some(hook.thread_created))
-            .map(|(thread_id, _)| *thread_id)
-            .collect();
-        for thread_id in &exited {
-            self.hooks.remove(thread_id);
-        }
-        exited
-    }
-
-    /// Tells the hook DLL to remove its window subclasses, then removes every hook.
-    pub fn detach(&mut self) -> DetachReport {
-        if self.hooks.is_empty() {
+    fn detach_one(&mut self, tid: u32) -> DetachReport {
+        let Some(hook) = self.hooks.remove(&tid) else {
             return DetachReport::default();
-        }
-        // The DLL reacts to the detach message from inside its hook, so the message has to
-        // arrive while the hooks are still installed.
-        let windows = (self.windows)();
-        let delivery = explorer::send_detach(&windows, self.library.detach_message_id());
-        let hooks_removed = std::mem::take(&mut self.hooks)
-            .into_values()
-            .filter(|hook| unsafe { UnhookWindowsHookEx(hook.handle) }.is_ok())
-            .count();
+        };
+        let current = explorer::explorer_views(&explorer::enumerate_explorer_windows())
+            .into_iter()
+            .filter(|view| view.thread_id == tid)
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let targets = hook
+            .views
+            .into_iter()
+            .chain(current)
+            .filter(|view| seen.insert(view.hwnd))
+            .collect::<Vec<_>>();
+        let delivery = explorer::send_message(&targets, self.library.detach_message_id());
+        let removed = unsafe { UnhookWindowsHookEx(hook.handle) }.is_ok();
         DetachReport {
-            windows: delivery.windows,
-            windows_acknowledged: delivery.delivered,
-            hooks_removed,
+            delivery,
+            hooks_removed: usize::from(removed),
         }
+    }
+
+    pub fn detach(&mut self) -> DetachReport {
+        let threads = self.hooks.keys().copied().collect::<Vec<_>>();
+        let mut total = DetachReport::default();
+        for tid in threads {
+            let report = self.detach_one(tid);
+            total.delivery.attempted += report.delivery.attempted;
+            total.delivery.acknowledged += report.delivery.acknowledged;
+            total.delivery.skipped_dead += report.delivery.skipped_dead;
+            total.hooks_removed += report.hooks_removed;
+        }
+        total
     }
 }
 
 impl Drop for HookSession<'_> {
     fn drop(&mut self) {
-        self.detach();
+        let _ = self.detach();
     }
 }
 
-/// Scans every `interval` until `stop` is set or `signal` fires, then detaches.
-pub fn run_until_stopped(
-    session: &mut HookSession<'_>,
-    signal: &HostSignal,
-    stop: &AtomicBool,
-    interval: Duration,
-    mut on_scan: impl FnMut(&ScanReport),
-) -> DetachReport {
-    while !stop.load(Ordering::SeqCst) {
-        on_scan(&session.scan());
-        if signal.wait_for_stop(interval) {
-            stop.store(true, Ordering::SeqCst);
-        }
-    }
-    session.detach()
+struct WindowState<'a> {
+    session: HookSession<'a>,
+    taskbar_created: u32,
 }
-
-unsafe extern "system" fn on_console_event(event: u32) -> BOOL {
-    if !matches!(
-        event,
-        CTRL_C_EVENT
-            | CTRL_BREAK_EVENT
-            | CTRL_CLOSE_EVENT
-            | CTRL_LOGOFF_EVENT
-            | CTRL_SHUTDOWN_EVENT
-    ) {
-        return FALSE;
-    }
-    STOP_REQUESTED.store(true, Ordering::SeqCst);
-    // Wakes the scan loop instead of letting it sleep out its interval.
-    request_stop(HOST_EVENT_NAME);
-
-    if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
-        // Windows kills the process as soon as this handler returns, so it holds on until
-        // the main thread has detached from Explorer.
-        let deadline = Instant::now() + CONSOLE_CLOSE_GRACE;
-        while !HOST_FINISHED.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+impl WindowState<'_> {
+    fn rescan(&mut self) {
+        let report = self.session.scan();
+        for failure in report.failed {
+            tracing::warn!(thread_id = failure.thread_id, reason = %failure.reason, "Explorer attach failed");
         }
-    }
-    TRUE
-}
-
-/// `rwm stop`: asks a running hook host (including `rwm run --hidden`) to detach and exit.
-pub fn stop() -> CliResult<ExitCode> {
-    match stop_running_host(HOST_EVENT_NAME, Duration::from_secs(10)) {
-        StopOutcome::Stopped => {
-            print_line("The running hook host detached and exited.");
-            Ok(ExitCode::SUCCESS)
-        }
-        StopOutcome::NotRunning => {
-            print_line("No hook host is running in this session.");
-            Ok(ExitCode::SUCCESS)
-        }
-        StopOutcome::TimedOut => Err(CliError::new(
-            "the running hook host did not exit within 10 seconds.",
-        )),
     }
 }
 
-/// `rwm run`.
-pub fn run(hidden: bool) -> CliResult<ExitCode> {
-    let exe =
-        std::env::current_exe().context(|| "cannot locate the running executable".to_string())?;
-    let dll_path = hookdll::locate(&exe).ok_or_else(|| hookdll::not_found_error(&exe))?;
+unsafe extern "system" fn winevent_callback(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    object_id: i32,
+    child_id: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if event != EVENT_OBJECT_CREATE || object_id != 0 || child_id != 0 || hwnd.is_invalid() {
+            return;
+        }
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class);
+        if len <= 0 {
+            return;
+        }
+        let class = String::from_utf16_lossy(&class[..len as usize]);
+        if explorer::is_view_class(&class) || explorer::is_top_level_class(&class) {
+            let host = HWND(HOST_HWND.load(Ordering::Acquire) as *mut std::ffi::c_void);
+            if !host.is_invalid() {
+                let _ = SetTimer(host, DEBOUNCE_TIMER, 75, None);
+            }
+        }
+    }));
+}
 
-    // Declared first so it is released last: the event disappearing tells `rwm uninstall`
-    // that the hooks are gone.
-    let signal = HostSignal::claim(HOST_EVENT_NAME).map_err(|err| match err {
-        ClaimError::AlreadyRunning => CliError::new(
-            "an rwm hook host is already running in this session. \
-             Run `rwm stop` (or press Ctrl+C in its console) before starting another.",
-        ),
-        ClaimError::Os(err) => CliError::new(format!(
-            "cannot create the host stop event: {}",
-            err.message()
-        )),
-    })?;
-    let library = HookLibrary::load(&dll_path)?;
-    unsafe { SetConsoleCtrlHandler(Some(on_console_event), true) }
-        .context(|| "cannot install the console control handler".to_string())?;
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let handled = catch_unwind(AssertUnwindSafe(|| {
+        let state = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+        ) as *mut WindowState<'_>;
+        if !state.is_null()
+            && (message == (*state).taskbar_created
+                || (message == WM_TIMER && matches!(wparam.0, DEBOUNCE_TIMER | SWEEP_TIMER)))
+        {
+            if message == WM_TIMER {
+                let _ = KillTimer(hwnd, wparam.0);
+            }
+            if message == WM_TIMER && wparam.0 == SWEEP_TIMER {
+                let _ = SetTimer(hwnd, SWEEP_TIMER, 5000, None);
+            }
+            (*state).rescan();
+            return Some(LRESULT(0));
+        }
+        if message == WM_DESTROY {
+            PostQuitMessage(0);
+            return Some(LRESULT(0));
+        }
+        None
+    }))
+    .ok()
+    .flatten();
+    handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam))
+}
 
-    if hidden {
+unsafe extern "system" fn console_event(event: u32) -> windows::Win32::Foundation::BOOL {
+    catch_unwind(AssertUnwindSafe(|| {
+        if matches!(
+            event,
+            CTRL_C_EVENT
+                | CTRL_BREAK_EVENT
+                | CTRL_CLOSE_EVENT
+                | CTRL_LOGOFF_EVENT
+                | CTRL_SHUTDOWN_EVENT
+        ) {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            let _ = request_stop(HOST_EVENT_NAME);
+            let deadline = Instant::now() + Duration::from_millis(4000);
+            while !HOST_FINISHED.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return windows::Win32::Foundation::TRUE;
+        }
+        windows::Win32::Foundation::FALSE
+    }))
+    .unwrap_or(windows::Win32::Foundation::FALSE)
+}
+
+struct ConsoleCtrlGuard;
+impl Drop for ConsoleCtrlGuard {
+    fn drop(&mut self) {
         unsafe {
-            let _ = FreeConsole();
+            let _ = SetConsoleCtrlHandler(Some(console_event), false);
         }
-    } else {
-        print_line(format!(
-            "RustWindowsMenu hook host {}",
-            env!("CARGO_PKG_VERSION")
-        ));
-        print_line(format!(
-            "Hook DLL: {} (ABI {SUPPORTED_ABI})",
-            library.path().display()
-        ));
-        let kill_switch = RwmConfig::kill_switch_path();
-        if kill_switch.exists() {
-            print_line(format!(
-                "Note: the kill switch {} exists, so every right-click goes to the Windows menu \
-                 until you delete that file.",
-                kill_switch.display()
-            ));
-        }
-        print_line("Press Ctrl+C to detach from Explorer and exit.");
     }
+}
 
-    let mut session = HookSession::new(&library, Box::new(explorer::enumerate_explorer_windows));
-    let mut first_scan = true;
-    let detached = run_until_stopped(
-        &mut session,
-        &signal,
-        &STOP_REQUESTED,
-        SCAN_INTERVAL,
-        |report| {
-            report_scan(report, first_scan);
-            first_scan = false;
-        },
+struct HostWindowGuard(HWND);
+impl Drop for HostWindowGuard {
+    fn drop(&mut self) {
+        HOST_HWND.store(0, Ordering::Release);
+        unsafe {
+            let _ = SetWindowLongPtrW(self.0, GWLP_USERDATA, 0);
+            let _ = KillTimer(self.0, DEBOUNCE_TIMER);
+            let _ = KillTimer(self.0, SWEEP_TIMER);
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+struct WinEventGuard(HWINEVENTHOOK);
+impl Drop for WinEventGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWinEvent(self.0);
+        }
+    }
+}
+
+struct FinishGuard;
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        HOST_FINISHED.store(true, Ordering::Release);
+    }
+}
+
+pub fn run() -> CliResult<ExitCode> {
+    ensure_matching_elevation("run")?;
+    STOP_REQUESTED.store(false, Ordering::Release);
+    HOST_FINISHED.store(false, Ordering::Release);
+    let _finish = FinishGuard;
+    let signal =
+        HostSignal::claim(HOST_MUTEX_NAME, HOST_EVENT_NAME).map_err(|error| match error {
+            ClaimError::AlreadyRunning => CliError::new("RustWindowsMenu host is already running"),
+            ClaimError::Os(error) => {
+                CliError::new(format!("cannot claim host instance: {}", error.message()))
+            }
+        })?;
+    let exe = std::env::current_exe().context(|| "cannot locate host executable".to_string())?;
+    let dll = hookdll::locate(&exe).ok_or_else(|| hookdll::not_found_error(&exe))?;
+    let library = HookLibrary::load(&dll)?;
+    unsafe { SetConsoleCtrlHandler(Some(console_event), true) }
+        .context(|| "cannot install console control handler".to_string())?;
+    let _console_guard = ConsoleCtrlGuard;
+    let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if !hookdll::is_registered_message(taskbar_created) {
+        return Err(CliError::new("could not register TaskbarCreated"));
+    }
+    let instance =
+        unsafe { GetModuleHandleW(None) }.context(|| "GetModuleHandleW failed".to_string())?;
+    let class = wide(HOST_WINDOW_CLASS);
+    let window_class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(window_proc),
+        hInstance: instance.into(),
+        lpszClassName: PCWSTR(class.as_ptr()),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&window_class) } == 0 {
+        return Err(windows::core::Error::from_win32().into());
+    }
+    // Hidden top-level overlapped window receives `TaskbarCreated` broadcasts unlike `HWND_MESSAGE`.
+    let hwnd = HostWindowGuard(
+        unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class.as_ptr()),
+                w!("RustWindowsMenu host"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .context(|| "cannot create host event window".to_string())?,
     );
-    drop(session);
+    HOST_HWND.store(hwnd.0 .0 as isize, Ordering::Release);
+    let event_hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_CREATE,
+            None,
+            Some(winevent_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if event_hook.is_invalid() {
+        return Err(CliError::new("SetWinEventHook failed"));
+    }
+    let _event_guard = WinEventGuard(event_hook);
+    let mut state = WindowState {
+        session: HookSession::new(&library),
+        taskbar_created,
+    };
+    unsafe {
+        SetWindowLongPtrW(
+            hwnd.0,
+            GWLP_USERDATA,
+            &mut state as *mut WindowState<'_> as isize,
+        );
+    }
+    signal.mark_ready()?;
+    state.rescan();
+    unsafe {
+        SetTimer(hwnd.0, SWEEP_TIMER, 5000, None);
+    }
+    let mut message = MSG::default();
+    while !STOP_REQUESTED.load(Ordering::Acquire) {
+        let wait = unsafe {
+            MsgWaitForMultipleObjects(Some(&[signal.event()]), false, u32::MAX, QS_ALLINPUT)
+        };
+        if wait == WAIT_OBJECT_0 {
+            break;
+        }
+        if wait.0 == WAIT_OBJECT_0.0 + 1 {
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if message.message == WM_QUIT {
+                    STOP_REQUESTED.store(true, Ordering::Release);
+                    break;
+                }
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        } else {
+            return Err(CliError::new(format!(
+                "host message wait failed: {}",
+                windows::core::Error::from_win32().message()
+            )));
+        }
+    }
+    let detached = state.session.detach();
+    drop(_event_guard);
+    drop(hwnd);
+    drop(state);
     drop(library);
-
     print_line(format!(
-        "Detached: {} of {} Explorer windows acknowledged, {} hooks removed.",
-        detached.windows_acknowledged, detached.windows, detached.hooks_removed
+        "Host detached {} Explorer hook(s); {} window acknowledgement(s).",
+        detached.hooks_removed, detached.delivery.acknowledged
     ));
-    HOST_FINISHED.store(true, Ordering::SeqCst);
     Ok(ExitCode::SUCCESS)
 }
 
-fn report_scan(report: &ScanReport, first_scan: bool) {
-    if !report.attached.is_empty() {
-        print_line(format!(
-            "Attached to {} Explorer UI thread(s), {} hooked in total.",
-            report.attached.len(),
-            report.hooked
-        ));
-    } else if first_scan && report.failed.is_empty() {
-        print_line("No Explorer windows found yet. Waiting for explorer.exe.");
-    }
-    for failure in &report.failed {
-        print_error_line(format!(
-            "Could not hook Explorer thread {}: {}",
-            failure.thread_id, failure.reason
-        ));
-    }
-    if !report.released.is_empty() {
-        tracing::debug!(threads = ?report.released, "hooked threads exited");
-    }
+pub fn start() -> CliResult<ExitCode> {
+    ensure_matching_elevation("start")?;
+    let exe = std::env::current_exe().context(|| "cannot locate rwm.exe".to_string())?;
+    start_host_exe(&exe.with_file_name("rwm-host.exe"))?;
+    print_line("rwm-host started and initialized successfully.");
+    Ok(ExitCode::SUCCESS)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PeImageFingerprint {
-    machine: u16,
-    num_sections: u16,
-    timestamp: u32,
-    size_of_code: u32,
-    size_of_initialized_data: u32,
-    entry_point_rva: u32,
-    size_of_image: u32,
-    checksum: u32,
-    export_dir: (u32, u32),
-    debug_dir: (u32, u32),
-    codeview_guid_age: Option<[u8; 20]>,
-}
-
-fn read_u16_le(buf: &[u8], offset: usize) -> Option<u16> {
-    let bytes: [u8; 2] = buf.get(offset..offset + 2)?.try_into().ok()?;
-    Some(u16::from_le_bytes(bytes))
-}
-
-fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
-    let bytes: [u8; 4] = buf.get(offset..offset + 4)?.try_into().ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn read_pe_fingerprint(
-    header: &[u8],
-    read_rva: impl Fn(u32, usize, u32) -> Option<Vec<u8>>,
-) -> Option<PeImageFingerprint> {
-    if read_u16_le(header, 0)? != 0x5A4D {
-        return None;
-    }
-    let e_lfanew = read_u32_le(header, 0x3C)? as usize;
-    if read_u32_le(header, e_lfanew)? != 0x0000_4550 {
-        return None;
-    }
-    let coff = e_lfanew.checked_add(4)?;
-    let machine = read_u16_le(header, coff)?;
-    let num_sections = read_u16_le(header, coff + 2)?;
-    let timestamp = read_u32_le(header, coff + 4)?;
-    let size_of_opt = read_u16_le(header, coff + 16)? as usize;
-
-    let opt = coff.checked_add(20)?;
-    // Require PE32+ (0x020B) so data directory offsets match 64-bit modules.
-    if size_of_opt < 112 || read_u16_le(header, opt)? != 0x020B {
-        return None;
-    }
-    let size_of_code = read_u32_le(header, opt + 4)?;
-    let size_of_initialized_data = read_u32_le(header, opt + 8)?;
-    let entry_point_rva = read_u32_le(header, opt + 16)?;
-    let size_of_image = read_u32_le(header, opt + 56)?;
-    let checksum = read_u32_le(header, opt + 64)?;
-    let num_dirs = read_u32_le(header, opt + 108)?;
-
-    let export_dir = if num_dirs > 0 && size_of_opt >= 120 {
-        (
-            read_u32_le(header, opt + 112)?,
-            read_u32_le(header, opt + 116)?,
-        )
-    } else {
-        (0, 0)
-    };
-    let debug_dir = if num_dirs > 6 && size_of_opt >= 168 {
-        (
-            read_u32_le(header, opt + 160)?,
-            read_u32_le(header, opt + 164)?,
-        )
-    } else {
-        (0, 0)
-    };
-
-    let mut codeview_guid_age = None;
-    if debug_dir.0 != 0 && debug_dir.1 >= 28 {
-        let count = (debug_dir.1 as usize / 28).min(8);
-        if let Some(table) = read_rva(debug_dir.0, count * 28, size_of_image) {
-            for entry in table.chunks_exact(28) {
-                let debug_type = read_u32_le(entry, 12);
-                let data_size = read_u32_le(entry, 16);
-                let data_rva = read_u32_le(entry, 20);
-                if debug_type == Some(2)
-                    && data_size.is_some_and(|s| s >= 24)
-                    && data_rva.is_some_and(|r| r != 0)
-                {
-                    if let Some(cv) = read_rva(data_rva.unwrap(), 24, size_of_image) {
-                        if cv.get(..4) == Some(b"RSDS") {
-                            if let Ok(arr) = <[u8; 20]>::try_from(&cv[4..24]) {
-                                codeview_guid_age = Some(arr);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Some(PeImageFingerprint {
-        machine,
-        num_sections,
-        timestamp,
-        size_of_code,
-        size_of_initialized_data,
-        entry_point_rva,
-        size_of_image,
-        checksum,
-        export_dir,
-        debug_dir,
-        codeview_guid_age,
-    })
-}
-
-fn local_pe_fingerprint(module: HMODULE) -> Option<PeImageFingerprint> {
-    if module.0.is_null() {
-        return None;
-    }
-    let base = module.0 as *const u8;
-    let header = unsafe { std::slice::from_raw_parts(base, 4096) };
-    read_pe_fingerprint(header, |rva, len, image_size| {
-        let end = (rva as usize).checked_add(len)?;
-        if end > image_size as usize {
-            return None;
-        }
-        let slice = unsafe { std::slice::from_raw_parts(base.add(rva as usize), len) };
-        Some(slice.to_vec())
-    })
-}
-
-fn is_hook_module_name(base_name: &str, expected_dll_name: &str) -> bool {
-    if base_name.eq_ignore_ascii_case(expected_dll_name) {
-        return true;
-    }
-    let prefix = format!("{expected_dll_name}.");
-    base_name.len() > prefix.len()
-        && base_name
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
-}
-
-struct ProcessHandle(HANDLE);
-
-impl Drop for ProcessHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
-fn read_remote_bytes(process: HANDLE, base: usize, len: usize) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let mut read = 0usize;
-    let ok = unsafe {
-        ReadProcessMemory(
-            process,
-            base as *const std::ffi::c_void,
-            buf.as_mut_ptr().cast(),
-            len,
-            Some(&mut read),
-        )
-    };
-    if ok.is_err() || read < len {
-        return None;
-    }
-    Some(buf)
-}
-
-fn remote_hook_dll_state(
-    process_id: u32,
-    expected_dll_name: &str,
-    expected: &PeImageFingerprint,
-) -> Result<(), String> {
-    let Ok(raw) =
-        (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, process_id) })
-    else {
-        return Ok(());
-    };
-    let process = ProcessHandle(raw);
-
-    let mut modules = vec![HMODULE::default(); 512];
-    let mut needed = 0u32;
-    let mut listed_ok = unsafe {
-        K32EnumProcessModules(
-            process.0,
-            modules.as_mut_ptr(),
-            (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
-            &mut needed,
-        )
-    }
-    .as_bool();
-    if !listed_ok {
-        return Ok(());
-    }
-    let total = needed as usize / std::mem::size_of::<HMODULE>();
-    if total > modules.len() {
-        modules.resize(total, HMODULE::default());
-        listed_ok = unsafe {
-            K32EnumProcessModules(
-                process.0,
-                modules.as_mut_ptr(),
-                (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
-                &mut needed,
-            )
-        }
-        .as_bool();
-        if !listed_ok {
-            return Ok(());
-        }
-    }
-    let count = (needed as usize / std::mem::size_of::<HMODULE>()).min(modules.len());
-
-    for &module in &modules[..count] {
-        let mut name_buf = [0u16; 260];
-        let name_len = unsafe { K32GetModuleBaseNameW(process.0, module, &mut name_buf) } as usize;
-        if name_len == 0 {
-            continue;
-        }
-        let base_name = String::from_utf16_lossy(&name_buf[..name_len]);
-        if !is_hook_module_name(&base_name, expected_dll_name) {
-            continue;
-        }
-        let base_addr = module.0 as usize;
-        let remote_fp = read_remote_bytes(process.0, base_addr, 4096).and_then(|hdr| {
-            read_pe_fingerprint(&hdr, |rva, len, image_size| {
-                let end = (rva as usize).checked_add(len)?;
-                if end > image_size as usize {
-                    return None;
-                }
-                read_remote_bytes(process.0, base_addr.checked_add(rva as usize)?, len)
-            })
-        });
-        if remote_fp.as_ref() != Some(expected) {
-            return Err(format!(
-                "process PID {process_id} still has an older or different build of {expected_dll_name} \
-                 mapped ({base_name}); restart explorer.exe before running the updated hook host"
+pub fn start_host_exe(host_exe: &Path) -> CliResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    match host_state(HOST_MUTEX_NAME) {
+        HostState::RunningOtherIntegrity => {
+            return Err(CliError::new(
+                "rwm-host is already running at another integrity level; stop it from that terminal first",
             ));
         }
+        HostState::Running => {
+            while Instant::now() < deadline {
+                if is_host_ready() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            return Err(CliError::new(
+                "the existing rwm-host did not finish initialization within 5 seconds",
+            ));
+        }
+        HostState::Stopped => {}
     }
-    Ok(())
+    if !host_exe.is_file() {
+        return Err(CliError::new(format!(
+            "host executable not found: {}",
+            host_exe.display()
+        )));
+    }
+    let mut command = Command::new(host_exe);
+    if let Some(dir) = host_exe.parent() {
+        command.current_dir(dir);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .spawn()
+        .context(|| format!("cannot launch {}", host_exe.display()))?;
+    while Instant::now() < deadline {
+        if is_host_ready() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(CliError::new(format!(
+                "rwm-host exited during initialization ({status})"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = stop_running_host(HOST_MUTEX_NAME, HOST_EVENT_NAME, Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(CliError::new(
+        "rwm-host did not initialize within 5 seconds",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::thread::JoinHandle;
-
-    use windows::core::w;
-    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, WPARAM};
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, PostThreadMessageW,
-        SendMessageTimeoutW, MSG, SMTO_ABORTIFHUNG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NULL,
-        WM_QUIT,
-    };
-
     use super::*;
-    use crate::explorer::WindowKind;
-    use crate::hookdll::HOOK_DLL_FILE;
     use crate::testutil::unique_name;
 
-    /// Creates a hidden window on this thread, reports it, and pumps messages until `WM_QUIT`.
-    fn run_hidden_window(report: impl FnOnce(isize, u32)) {
-        unsafe {
-            let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("Static"),
-                w!("rwm host test window"),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("create hidden test window");
-            report(hwnd.0 as isize, GetCurrentThreadId());
-            let mut message = MSG::default();
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                DispatchMessageW(&message);
-            }
-            let _ = DestroyWindow(hwnd);
-        }
-    }
-
-    fn stop_window_thread(thread_id: u32) {
-        unsafe {
-            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
-    }
-
-    /// A hidden window with its own message loop, standing in for an Explorer UI thread.
-    /// It lives in this test process, so nothing here touches the real Explorer.
-    struct WindowThread {
-        window: ShellWindow,
-        join: Option<JoinHandle<()>>,
-    }
-
-    impl WindowThread {
-        fn spawn() -> Self {
-            let (ready, started) = mpsc::channel();
-            let join = std::thread::spawn(move || {
-                run_hidden_window(|hwnd, thread_id| {
-                    ready.send((hwnd, thread_id)).expect("report window");
-                });
-            });
-            let (hwnd, thread_id) = started.recv().expect("window thread started");
-            Self {
-                window: ShellWindow {
-                    hwnd,
-                    kind: WindowKind::TopLevel,
-                    class_name: "CabinetWClass".to_string(),
-                    process_id: std::process::id(),
-                    thread_id,
-                },
-                join: Some(join),
-            }
-        }
-
-        fn stop(&mut self) {
-            if let Some(join) = self.join.take() {
-                stop_window_thread(self.window.thread_id);
-                join.join().expect("window thread exits");
-            }
-        }
-    }
-
-    impl Drop for WindowThread {
-        fn drop(&mut self) {
-            self.stop();
-        }
-    }
-
-    const WINDOW_HOST_ENV: &str = "RWM_TEST_WINDOW_HOST";
-    const WINDOW_HOST_MARKER: &str = "rwm-window-host";
-
-    /// Not a test of its own. `hook_dll_is_injected_into_another_process` starts this test
-    /// binary again with the variable set, and that child runs a hidden window here.
     #[test]
-    #[ignore = "child process entry point of hook_dll_is_injected_into_another_process"]
-    fn window_host_child() {
-        if std::env::var_os(WINDOW_HOST_ENV).is_none() {
-            return;
-        }
-        run_hidden_window(|hwnd, thread_id| {
-            println!("{WINDOW_HOST_MARKER} {hwnd} {thread_id}");
-        });
-    }
-
-    /// A second process with one hidden window: a stand-in for `explorer.exe` that the hook
-    /// DLL treats as "not Explorer" and therefore leaves alone once it is loaded.
-    struct WindowProcess {
-        child: Child,
-        window: ShellWindow,
-    }
-
-    impl WindowProcess {
-        fn spawn() -> Self {
-            let mut child = Command::new(std::env::current_exe().expect("test executable path"))
-                .args([
-                    "--exact",
-                    "host::tests::window_host_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env(WINDOW_HOST_ENV, "1")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start the window host process");
-            let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
-            let (hwnd, thread_id) = stdout
-                .lines()
-                .map_while(Result::ok)
-                .find_map(|line| {
-                    let mut fields = line.strip_prefix(WINDOW_HOST_MARKER)?.split_whitespace();
-                    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-                })
-                .expect("the window host reports its window");
-            let window = ShellWindow {
-                hwnd,
-                kind: WindowKind::TopLevel,
-                class_name: "CabinetWClass".to_string(),
-                process_id: child.id(),
-                thread_id,
-            };
-            Self { child, window }
-        }
-
-        /// Makes the window's thread process a sent message. Windows loads a hook DLL into a
-        /// process the first time one of its hooked threads does that.
-        fn nudge(&self) {
-            unsafe {
-                SendMessageTimeoutW(
-                    HWND(self.window.hwnd as *mut c_void),
-                    WM_NULL,
-                    WPARAM(0),
-                    LPARAM(0),
-                    SMTO_ABORTIFHUNG,
-                    2000,
-                    None,
-                );
-            }
-        }
-
-        fn has_module(&self, file_name: &str) -> bool {
-            unsafe {
-                let process = OpenProcess(
-                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                    false,
-                    self.child.id(),
-                )
-                .expect("open the window host process");
-                let mut modules = [HMODULE::default(); 512];
-                let mut bytes = 0u32;
-                let listed = K32EnumProcessModules(
-                    process,
-                    modules.as_mut_ptr(),
-                    std::mem::size_of_val(&modules) as u32,
-                    &mut bytes,
-                );
-                assert!(listed.as_bool(), "list the window host's modules");
-                let count = (bytes as usize / std::mem::size_of::<HMODULE>()).min(modules.len());
-                let found = modules[..count].iter().any(|module| {
-                    let mut name = [0u16; 260];
-                    let len = K32GetModuleBaseNameW(process, *module, &mut name) as usize;
-                    String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case(file_name)
-                });
-                let _ = CloseHandle(process);
-                found
-            }
-        }
-    }
-
-    impl Drop for WindowProcess {
-        fn drop(&mut self) {
-            stop_window_thread(self.window.thread_id);
-            let exited = (0..100).any(|_| {
-                std::thread::sleep(Duration::from_millis(20));
-                matches!(self.child.try_wait(), Ok(Some(_)))
-            });
-            if !exited {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-    }
-
-    fn built_hook_dll() -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().expect("test executable path");
-        let dll = hookdll::locate(&exe);
-        if dll.is_none() {
-            eprintln!("skipped: rwm_hook.dll is not built (cargo build -p rwm-hook)");
-        }
-        dll
-    }
-
-    fn next_scan(
-        scanned: &mpsc::Receiver<ScanReport>,
-        wanted: impl Fn(&ScanReport) -> bool,
-    ) -> ScanReport {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let report = scanned
-                .recv_timeout(remaining)
-                .expect("the host loop keeps scanning");
-            if wanted(&report) {
-                return report;
-            }
-        }
-    }
-
-    #[test]
-    fn only_one_host_can_claim_the_event() {
-        let name = format!(r"Local\{}", unique_name("claim"));
-        assert!(!is_host_running(&name));
-
-        let signal = HostSignal::claim(&name).expect("first claim");
-        assert!(is_host_running(&name));
+    fn single_instance_claim_and_graceful_stop_are_scoped() {
+        let mutex = format!(r"Local\{}", unique_name("mutex"));
+        let event = format!(r"Local\{}", unique_name("event"));
+        let signal = HostSignal::claim(&mutex, &event).unwrap();
+        assert!(is_host_running(&mutex));
         assert!(matches!(
-            HostSignal::claim(&name),
+            HostSignal::claim(&mutex, &event),
             Err(ClaimError::AlreadyRunning)
         ));
-
+        let waiter = std::thread::spawn({
+            let mutex = mutex.clone();
+            let event = event.clone();
+            move || stop_running_host(&mutex, &event, Duration::from_millis(50)).unwrap()
+        });
+        assert_eq!(waiter.join().unwrap(), StopOutcome::TimedOut);
         drop(signal);
-        assert!(!is_host_running(&name));
-        drop(HostSignal::claim(&name).expect("claim again after release"));
-    }
-
-    #[test]
-    fn stop_request_reaches_the_owner_of_the_event() {
-        let name = format!(r"Local\{}", unique_name("stop"));
+        assert!(!is_host_running(&mutex));
         assert_eq!(
-            stop_running_host(&name, Duration::from_millis(50)),
+            stop_running_host(&mutex, &event, Duration::ZERO).unwrap(),
             StopOutcome::NotRunning
         );
-
-        let signal = HostSignal::claim(&name).expect("claim");
-        assert!(!signal.wait_for_stop(Duration::ZERO));
-        assert_eq!(
-            stop_running_host(&name, Duration::from_millis(100)),
-            StopOutcome::TimedOut,
-            "the owner is still alive"
-        );
-        assert!(signal.wait_for_stop(Duration::ZERO));
-    }
-
-    #[test]
-    fn a_reused_thread_id_is_told_apart_by_creation_time() {
-        let current = unsafe { GetCurrentThreadId() };
-        let created = thread_created_at(current).expect("current thread is alive");
-        assert_eq!(thread_created_at(current), Some(created));
-
-        let (thread_id, created_inside) = std::thread::spawn(|| {
-            let thread_id = unsafe { GetCurrentThreadId() };
-            (thread_id, thread_created_at(thread_id))
-        })
-        .join()
-        .expect("probe thread");
-        assert!(created_inside.is_some());
-        assert_ne!(
-            thread_created_at(thread_id),
-            created_inside,
-            "the thread has exited"
-        );
-    }
-
-    #[test]
-    fn session_hooks_each_thread_once_and_detaches_everything() {
-        let Some(dll) = built_hook_dll() else {
-            return;
-        };
-        let library = HookLibrary::load(&dll).expect("hook DLL loads");
-        let mut first = WindowThread::spawn();
-        let second = WindowThread::spawn();
-        let windows = Arc::new(Mutex::new(vec![first.window.clone()]));
-
-        let listed = Arc::clone(&windows);
-        let mut session =
-            HookSession::new(&library, Box::new(move || listed.lock().unwrap().clone()));
-
-        let scan = session.scan();
-        assert_eq!(scan.attached, vec![first.window.thread_id]);
-        assert_eq!(scan.failed, Vec::new());
-        assert_eq!(scan.hooked, 1);
-
-        let rescan = session.scan();
-        assert_eq!(
-            rescan.attached,
-            Vec::<u32>::new(),
-            "no second hook on the same thread"
-        );
-        assert_eq!(rescan.hooked, 1);
-
-        windows.lock().unwrap().push(second.window.clone());
-        let grown = session.scan();
-        assert_eq!(grown.attached, vec![second.window.thread_id]);
-        assert_eq!(grown.hooked, 2);
-
-        first.stop();
-        windows.lock().unwrap().remove(0);
-        let after_exit = session.scan();
-        assert_eq!(after_exit.released, vec![first.window.thread_id]);
-        assert_eq!(after_exit.hooked, 1);
-
-        let detached = session.detach();
-        assert_eq!(
-            detached,
-            DetachReport {
-                windows: 1,
-                windows_acknowledged: 1,
-                hooks_removed: 1
-            }
-        );
-        assert_eq!(
-            session.detach(),
-            DetachReport::default(),
-            "nothing is left to detach"
-        );
-    }
-
-    #[test]
-    fn host_loop_picks_up_new_threads_and_stops_on_request() {
-        let Some(dll) = built_hook_dll() else {
-            return;
-        };
-        let name = format!(r"Local\{}", unique_name("loop"));
-        let first = WindowThread::spawn();
-        let second = WindowThread::spawn();
-        let windows = Arc::new(Mutex::new(vec![first.window.clone()]));
-        let (scans, scanned) = mpsc::channel::<ScanReport>();
-        let stop = AtomicBool::new(false);
-
-        let detached = std::thread::scope(|scope| {
-            let host = scope.spawn(|| {
-                let library = HookLibrary::load(&dll).expect("hook DLL loads");
-                let signal = HostSignal::claim(&name).expect("claim host event");
-                let listed = Arc::clone(&windows);
-                let mut session =
-                    HookSession::new(&library, Box::new(move || listed.lock().unwrap().clone()));
-                run_until_stopped(
-                    &mut session,
-                    &signal,
-                    &stop,
-                    Duration::from_millis(10),
-                    |report| {
-                        let _ = scans.send(report.clone());
-                    },
-                )
-            });
-
-            let first_scan = next_scan(&scanned, |_| true);
-            assert_eq!(first_scan.attached, vec![first.window.thread_id]);
-
-            windows.lock().unwrap().push(second.window.clone());
-            let picked_up = next_scan(&scanned, |report| !report.attached.is_empty());
-            assert_eq!(picked_up.attached, vec![second.window.thread_id]);
-            assert_eq!(picked_up.hooked, 2);
-
-            assert_eq!(
-                stop_running_host(&name, Duration::from_secs(5)),
-                StopOutcome::Stopped
-            );
-            host.join().expect("host thread")
-        });
-
-        assert_eq!(
-            detached,
-            DetachReport {
-                windows: 2,
-                windows_acknowledged: 2,
-                hooks_removed: 2
-            }
-        );
-        assert!(stop.load(Ordering::SeqCst));
-        assert!(!is_host_running(&name));
-    }
-
-    #[test]
-    fn hook_dll_is_injected_into_another_process() {
-        let Some(dll) = built_hook_dll() else {
-            return;
-        };
-        let library = HookLibrary::load(&dll).expect("hook DLL loads");
-        let target = WindowProcess::spawn();
-        let listed = vec![target.window.clone()];
-        let mut session = HookSession::new(&library, Box::new(move || listed.clone()));
-
-        target.nudge();
-        assert!(
-            !target.has_module(HOOK_DLL_FILE),
-            "nothing is injected before the hook"
-        );
-
-        assert_eq!(session.scan().attached, vec![target.window.thread_id]);
-        target.nudge();
-        assert!(
-            target.has_module(HOOK_DLL_FILE),
-            "the hook brought the DLL into the other process"
-        );
-
-        assert_eq!(
-            session.detach(),
-            DetachReport {
-                windows: 1,
-                windows_acknowledged: 1,
-                hooks_removed: 1
-            }
-        );
-    }
-
-    #[test]
-    fn remote_pe_fingerprint_accepts_matching_build_and_rejects_mismatched_build() {
-        let Some(dll) = built_hook_dll() else {
-            return;
-        };
-        let library = HookLibrary::load(&dll).expect("hook DLL loads");
-        let fp = local_pe_fingerprint(library.module()).expect("parse loaded PE fingerprint");
-        assert!(
-            remote_hook_dll_state(std::process::id(), HOOK_DLL_FILE, &fp).is_ok(),
-            "same build already loaded in this process should pass"
-        );
-
-        let mut wrong = fp.clone();
-        wrong.timestamp ^= 1;
-        let err = remote_hook_dll_state(std::process::id(), HOOK_DLL_FILE, &wrong)
-            .expect_err("mismatched PE fingerprint must be rejected");
-        assert!(err.contains("restart explorer.exe"), "{err}");
-
-        assert!(is_hook_module_name("rwm_hook.dll", HOOK_DLL_FILE));
-        assert!(is_hook_module_name("RWM_HOOK.DLL.1234.old", HOOK_DLL_FILE));
-        assert!(!is_hook_module_name("kernel32.dll", HOOK_DLL_FILE));
     }
 }
